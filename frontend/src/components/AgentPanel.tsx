@@ -26,6 +26,11 @@ const statusIcons = {
 
 export function AgentPanel() {
   const agents = useAgentStore((state) => state.agents);
+  
+  // Filter out stopped and idle agents - only show active ones
+  const activeAgents = agents.filter((agent) => 
+    agent.status === 'busy' || agent.status === 'error'
+  );
 
   return (
     <div className="flex flex-col h-full">
@@ -34,9 +39,9 @@ export function AgentPanel() {
         <h2 className="font-display font-semibold text-void-200 flex items-center gap-2">
           <Bot className="w-5 h-5 text-neon-pink" />
           Active Agents
-          {agents.length > 0 && (
+          {activeAgents.length > 0 && (
             <span className="text-xs text-void-500 font-mono">
-              ({agents.length})
+              ({activeAgents.length})
             </span>
           )}
         </h2>
@@ -44,14 +49,14 @@ export function AgentPanel() {
 
       {/* Agents Grid */}
       <div className="flex-1 overflow-y-auto p-4">
-        {agents.length === 0 ? (
+        {activeAgents.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-void-500">
             <Bot className="w-12 h-12 mb-3 opacity-30" />
             <p className="text-sm font-mono">No agents running</p>
           </div>
         ) : (
           <div className="grid grid-cols-2 gap-3">
-            {agents.map((agent) => {
+            {activeAgents.map((agent) => {
               const TypeIcon = typeIcons[agent.type] || Bot;
               const StatusIcon = statusIcons[agent.status];
               const statusColor = statusColors[agent.status];
