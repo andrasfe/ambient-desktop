@@ -223,6 +223,76 @@ class TestBrowserAgent:
         mock_page.inner_text.assert_called_once_with("body")
         assert result["text"] == "Page content here"
 
+    @pytest.mark.asyncio
+    async def test_edit_fields_semantic_match_fills(self):
+        """edit_fields should fall back to semantic-ish matching when get_by_label finds nothing."""
+        agent = BrowserAgent()
+
+        # Mock minimal page APIs used by edit_fields.
+        mock_page = AsyncMock()
+
+        # match_text exists
+        mock_item = AsyncMock()
+        mock_item.count = AsyncMock(return_value=1)
+        mock_page.get_by_text = MagicMock(return_value=mock_item)
+
+        # No edit button is required for this unit test; make clicks no-op / absent.
+        mock_btn = AsyncMock()
+        mock_btn.count = AsyncMock(return_value=0)
+        mock_page.get_by_role = MagicMock(return_value=mock_btn)
+
+        # get_by_label finds nothing, forcing fallback
+        mock_empty_loc = AsyncMock()
+        mock_empty_loc.count = AsyncMock(return_value=0)
+        mock_page.get_by_label = MagicMock(return_value=mock_empty_loc)
+
+        # Evaluate returns candidate inputs metadata (index 0 is "Title", index 1 is "Patent number")
+        mock_page.evaluate = AsyncMock(
+            return_value=[
+                {"index": 0, "label": "Title", "aria": "", "placeholder": "", "name": "title", "id": "title", "nearby": ""},
+                {"index": 1, "label": "Patent number", "aria": "", "placeholder": "", "name": "patentNumber", "id": "patentNumber", "nearby": ""},
+            ]
+        )
+
+        # locator(...) returns a collection we can nth() into.
+        mock_inputs = MagicMock()
+        input0 = AsyncMock()
+        input0.first = input0
+        input0.fill = AsyncMock()
+        input0.click = AsyncMock()
+        input0.input_value = AsyncMock(return_value="Original Title")
+
+        input1 = AsyncMock()
+        input1.first = input1
+        input1.fill = AsyncMock()
+        input1.click = AsyncMock()
+        input1.input_value = AsyncMock(return_value="US-123")
+
+        mock_inputs.nth = MagicMock(side_effect=[input0, input1])
+        mock_page.locator = MagicMock(return_value=mock_inputs)
+
+        # Other methods referenced
+        mock_page.keyboard = MagicMock()
+        mock_page.keyboard.press = AsyncMock()
+        mock_page.keyboard.type = AsyncMock()
+        mock_page.url = "https://example.com"
+        mock_page.title = AsyncMock(return_value="Example")
+
+        agent._page = mock_page
+        agent.update_status = AsyncMock()
+
+        res = await agent._action_edit_fields(
+            {
+                "match_text": "US-123",
+                "fields": {"Patent No": "US-123"},  # fuzzy match to "Patent number"
+                "timeout": 15000,
+            }
+        )
+
+        assert res.get("error") is None
+        # Should have filled the 2nd field (index 1)
+        assert input1.fill.called
+
     def test_is_ready_false(self):
         """Test is_ready when browser not started."""
         agent = BrowserAgent()

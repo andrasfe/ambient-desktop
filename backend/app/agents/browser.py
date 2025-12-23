@@ -4,6 +4,7 @@ import asyncio
 import base64
 from typing import Any, Optional
 from pathlib import Path
+from difflib import SequenceMatcher
 
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
@@ -202,6 +203,7 @@ class BrowserAgent(BaseAgent):
             "wait": self._action_wait,
             "scroll": self._action_scroll,
             "evaluate": self._action_evaluate,
+            "edit_fields": self._action_edit_fields,
         }
         
         handler = handlers.get(action)
@@ -545,6 +547,283 @@ class BrowserAgent(BaseAgent):
         result = await self._page.evaluate(script)
         
         return {"result": result}
+
+    async def _action_edit_fields(self, payload: dict) -> dict[str, Any]:
+        """Generic edit helper: open an item's edit UI by matching text, then set/swap fields by label.
+
+        Params:
+          - match_text (str, required): text that identifies the item to edit (e.g., an ID / number / title)
+          - fields (dict[str, str], optional): field_name -> new value (field_name is matched fuzzily)
+          - swap (list[str], optional): two field names to swap values between (names are matched fuzzily)
+          - open_edit_texts (list[str], optional): button texts to open editor (defaults include Edit/Update/Change)
+          - save_texts (list[str], optional): button texts to save changes (defaults include Save/Done/Apply/Update)
+          - timeout (int ms, optional): per-step timeout (default 15000)
+        """
+        import asyncio
+
+        if not self._page:
+            raise RuntimeError("Browser page not initialized")
+
+        match_text = payload.get("match_text")
+        if not match_text:
+            return {"error": "match_text is required for edit_fields"}
+
+        fields: dict[str, str] = payload.get("fields") or {}
+        swap_labels = payload.get("swap") or []
+        timeout = payload.get("timeout", 15000)
+
+        open_edit_texts = payload.get(
+            "open_edit_texts",
+            ["Edit", "Update", "Change", "Modify", "Pencil"],
+        )
+        save_texts = payload.get(
+            "save_texts",
+            ["Save", "Done", "Apply", "Update", "OK", "Confirm"],
+        )
+
+        await self.update_status(AgentStatus.BUSY, summary=f"Editing fields for item matching: {match_text[:40]}")
+
+        # Locate the item by text
+        item_locator = self._page.get_by_text(match_text, exact=False)
+        if await item_locator.count() == 0:
+            return {"error": f"Could not find item containing text: {match_text}", "url": self._page.url}
+
+        # Best-effort: open edit UI near the item.
+        opened = False
+        last_open_error: str | None = None
+
+        # 1) Try common edit button texts anywhere (generic)
+        for t in open_edit_texts:
+            try:
+                btn = self._page.get_by_role("button", name=t)
+                if await btn.count() > 0:
+                    await btn.first.click(timeout=3000)
+                    opened = True
+                    break
+            except Exception as e:
+                last_open_error = str(e)
+
+        # 2) Try aria-label patterns (generic)
+        if not opened:
+            for sel in [
+                "[aria-label*='edit' i]",
+                "[aria-label*='update' i]",
+                "button:has-text('Edit')",
+                "button:has-text('edit')",
+            ]:
+                try:
+                    loc = self._page.locator(sel)
+                    if await loc.count() > 0:
+                        await loc.first.click(timeout=3000)
+                        opened = True
+                        break
+                except Exception as e:
+                    last_open_error = str(e)
+
+        # Wait a beat for dialogs/panels to appear if something was clicked.
+        if opened:
+            await asyncio.sleep(0.5)
+
+        def _norm(s: str) -> str:
+            return " ".join((s or "").lower().replace("_", " ").replace("-", " ").split())
+
+        def _token_score(a: str, b: str) -> float:
+            a_toks = set(_norm(a).split())
+            b_toks = set(_norm(b).split())
+            if not a_toks or not b_toks:
+                return 0.0
+            return len(a_toks & b_toks) / max(len(a_toks), len(b_toks))
+
+        def _sim(a: str, b: str) -> float:
+            return SequenceMatcher(None, _norm(a), _norm(b)).ratio()
+
+        def _score(target: str, hint: str) -> float:
+            # Heuristic similarity: char similarity + token overlap
+            return 0.65 * _sim(target, hint) + 0.35 * _token_score(target, hint)
+
+        async def _load_field_candidates() -> list[dict[str, Any]]:
+            """Return metadata for inputs on the page so we can fuzzy-match field names locally.
+
+            We intentionally keep this generic: label text, aria-label, placeholder, name/id, plus nearby text.
+            """
+            return await self._page.evaluate(
+                """
+                () => {
+                  const els = Array.from(document.querySelectorAll('input, textarea, select, [contenteditable="true"]'));
+                  const txt = (x) => (x || '').toString().replace(/\\s+/g,' ').trim();
+                  const labelFor = (el) => {
+                    const id = el.getAttribute('id');
+                    if (id) {
+                      const lab = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+                      if (lab) return txt(lab.innerText);
+                    }
+                    const wrap = el.closest('label');
+                    if (wrap) return txt(wrap.innerText);
+                    // common pattern: a label preceding input in same container
+                    const container = el.closest('div, section, form');
+                    if (container) {
+                      const lab = container.querySelector('label');
+                      if (lab) return txt(lab.innerText);
+                    }
+                    return '';
+                  };
+                  return els.map((el, index) => {
+                    const aria = txt(el.getAttribute('aria-label'));
+                    const ph = txt(el.getAttribute('placeholder'));
+                    const name = txt(el.getAttribute('name'));
+                    const id = txt(el.getAttribute('id'));
+                    const lab = labelFor(el);
+                    const parent = el.parentElement;
+                    const nearby = parent ? txt(parent.innerText).slice(0, 160) : '';
+                    return { index, aria, placeholder: ph, name, id, label: lab, nearby };
+                  });
+                }
+                """
+            )
+
+        field_candidates: list[dict[str, Any]] | None = None
+
+        async def _resolve_field(field_name: str):
+            # 1) Try Playwright label association first
+            by_label = self._page.get_by_label(field_name, exact=False)
+            if await by_label.count() > 0:
+                return by_label
+
+            # 2) Fuzzy match against input metadata gathered from the page
+            nonlocal field_candidates
+            if field_candidates is None:
+                field_candidates = await _load_field_candidates()
+
+            best_idx: int | None = None
+            best_score = 0.0
+            for cand in field_candidates:
+                hints = [
+                    cand.get("label", ""),
+                    cand.get("aria", ""),
+                    cand.get("placeholder", ""),
+                    cand.get("name", ""),
+                    cand.get("id", ""),
+                    cand.get("nearby", ""),
+                ]
+                cand_best = 0.0
+                for h in hints:
+                    if h:
+                        cand_best = max(cand_best, _score(field_name, h))
+                if cand_best > best_score:
+                    best_score = cand_best
+                    best_idx = int(cand.get("index", -1))
+
+            # Threshold to avoid random mismatches
+            if best_idx is None or best_idx < 0 or best_score < 0.55:
+                raise RuntimeError(f"Field not found (semantic match failed) for: {field_name}")
+
+            inputs = self._page.locator("input, textarea, select, [contenteditable='true']")
+            return inputs.nth(best_idx)
+
+        # Helper to get and set by label/semantic match
+        async def _get_value(label: str) -> str:
+            el = await _resolve_field(label)
+            try:
+                return await el.first.input_value()
+            except Exception:
+                # Fallback for non-input elements
+                return (await el.first.inner_text()) or ""
+
+        async def _set_value(label: str, value: str) -> None:
+            el = await _resolve_field(label)
+            # Most forms use <input>/<textarea>
+            try:
+                await el.first.fill(value, timeout=timeout)
+            except Exception:
+                # Fallback: click + type (best effort)
+                await el.first.click(timeout=timeout)
+                await self._page.keyboard.press("Control+A")
+                await self._page.keyboard.type(value)
+
+        before: dict[str, str] = {}
+        after: dict[str, str] = {}
+
+        try:
+            # Collect current values for swap targets and explicit fields
+            labels_to_read = set(fields.keys())
+            if isinstance(swap_labels, list) and len(swap_labels) == 2:
+                labels_to_read.update([swap_labels[0], swap_labels[1]])
+
+            for lbl in labels_to_read:
+                try:
+                    before[lbl] = await _get_value(lbl)
+                except Exception:
+                    # Ignore missing reads; will raise on set
+                    pass
+
+            # Apply swap if requested
+            if isinstance(swap_labels, list) and len(swap_labels) == 2:
+                a, b = swap_labels[0], swap_labels[1]
+                a_val = before.get(a, await _get_value(a))
+                b_val = before.get(b, await _get_value(b))
+                await _set_value(a, b_val)
+                await _set_value(b, a_val)
+                after[a] = b_val
+                after[b] = a_val
+
+            # Apply explicit field updates
+            for lbl, val in fields.items():
+                await _set_value(lbl, val)
+                after[lbl] = val
+
+            # Click a save/confirm action if present
+            saved = False
+            for t in save_texts:
+                try:
+                    btn = self._page.get_by_role("button", name=t)
+                    if await btn.count() > 0 and await btn.first.is_visible():
+                        await btn.first.click(timeout=timeout)
+                        saved = True
+                        break
+                except Exception:
+                    continue
+
+            return {
+                "match_text": match_text,
+                "opened_editor": opened,
+                "open_error": None if opened else last_open_error,
+                "saved": saved,
+                "before": before,
+                "after": after,
+                "url": self._page.url,
+                "title": await self._page.title(),
+            }
+        except Exception as e:
+            return {
+                "error": f"edit_fields failed: {str(e)}",
+                "match_text": match_text,
+                "opened_editor": opened,
+                "open_error": None if opened else last_open_error,
+                "before": before,
+                "after": after,
+                "url": self._page.url,
+            }
+
+    async def edit_fields(
+        self,
+        match_text: str,
+        fields: dict[str, str] | None = None,
+        swap: list[str] | None = None,
+        open_edit_texts: list[str] | None = None,
+        save_texts: list[str] | None = None,
+        timeout: int = 15000,
+    ) -> dict[str, Any]:
+        """Convenience wrapper for edit_fields."""
+        return await self._action_edit_fields(
+            {
+                "match_text": match_text,
+                "fields": fields or {},
+                "swap": swap or [],
+                "open_edit_texts": open_edit_texts,
+                "save_texts": save_texts,
+                "timeout": timeout,
+            }
+        )
 
     # Convenience methods for programmatic use
     async def navigate(self, url: str) -> dict[str, Any]:

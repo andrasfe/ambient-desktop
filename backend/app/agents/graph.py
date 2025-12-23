@@ -105,6 +105,8 @@ BROWSER agent actions:
 - "click" - Click an element. params: {"text": "button text"} (prefer text over selectors)
 - "navigate" - Go to a URL. params: {"url": "https://..."}
 - "type" - Type into input. params: {"selector": "input", "text": "text"}
+- "edit_fields" - Generic edit in a form: find item by text and set/swap fields by semantic-ish field name matching.
+  params: {"match_text": "...", "swap": ["Field A", "Field B"]} or {"match_text": "...", "fields": {"Field": "New value"}}
 - "screenshot" - Take screenshot. params: {}
 - "list_tabs" - List open tabs. params: {}
 
@@ -158,6 +160,7 @@ IMPORTANT:
 - Use ONLY the action names listed above
 - Check current browser state BEFORE planning navigation
 - Prefer minimal actions - if content is already visible, just extract!
+- It's OK (and expected) for subagents to perform MULTIPLE steps in sequence (one step at a time) to complete a request.
 - NEVER output raw tool-call markup"""
 
 # Some OpenRouter models sometimes emit raw "tool call" markup (e.g. <|tool_call_begin|>).
@@ -628,6 +631,20 @@ async def browser_node(state: AgentState) -> dict:
                 result = {"result": await agent.page.evaluate(script)}
             else:
                 result = {"error": "No script provided"}
+        elif "edit_fields" in action_lower or ("edit" in action_lower and "field" in action_lower):
+            # Generic edit: locate an item by match_text and set/swap fields
+            match_text = params.get("match_text")
+            if not match_text:
+                result = {"error": "edit_fields requires match_text"}
+            else:
+                result = await agent.edit_fields(
+                    match_text=match_text,
+                    fields=params.get("fields") or None,
+                    swap=params.get("swap") or None,
+                    open_edit_texts=params.get("open_edit_texts") or None,
+                    save_texts=params.get("save_texts") or None,
+                    timeout=int(params.get("timeout", 15000) or 15000),
+                )
         else:
             result = {"error": f"Unknown action: {action}", "hint": "Use: navigate, click, type, extract, screenshot, scroll, wait, list_tabs, switch_tab"}
         
