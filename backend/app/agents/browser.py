@@ -325,6 +325,7 @@ class BrowserAgent(BaseAgent):
         attribute = payload.get("attribute")
         all_matches = payload.get("all", False)
         timeout = payload.get("timeout", 15000)  # 15 second default for dynamic sites
+        full_page = payload.get("full_page", True)  # Auto-scroll and expand by default
         
         await self.update_status(AgentStatus.BUSY, summary=f"Extracting from: {selector or 'page'}")
         
@@ -334,6 +335,10 @@ class BrowserAgent(BaseAgent):
         except Exception:
             pass  # Continue even if network doesn't settle
         
+        # Auto-scroll and expand for full page extraction
+        if full_page and not selector:
+            await self._load_full_page()
+        
         # Get page info for context
         page_info = {
             "url": self._page.url,
@@ -341,9 +346,9 @@ class BrowserAgent(BaseAgent):
         }
         
         if not selector:
-            # Extract all visible text (limit to 50KB for safety)
+            # Extract all visible text (limit to 100KB for safety)
             text = await self._page.inner_text("body")
-            max_len = 50000  # 50KB should be enough for most pages
+            max_len = 100000  # 100KB for full page extractions
             return {"text": text[:max_len], "truncated": len(text) > max_len, **page_info}
         
         try:
@@ -388,6 +393,72 @@ class BrowserAgent(BaseAgent):
                 "selector": selector,
                 **page_info,
             }
+
+    async def _load_full_page(self) -> None:
+        """Scroll through page and click 'show more' buttons to load all content."""
+        import asyncio
+        
+        # Common "show more" button patterns (generic, not site-specific)
+        more_button_patterns = [
+            "text=/show\\s*(all|more)/i",
+            "text=/load\\s*more/i",
+            "text=/see\\s*(all|more)/i",
+            "text=/view\\s*(all|more)/i",
+            "text=/expand/i",
+            "[aria-label*='more' i]",
+            "[aria-label*='expand' i]",
+            "button:has-text('more')",
+            "a:has-text('more')",
+        ]
+        
+        await self.update_status(AgentStatus.BUSY, summary="Loading full page content...")
+        
+        # Scroll to bottom progressively to trigger lazy loading
+        prev_height = 0
+        scroll_attempts = 0
+        max_scrolls = 20  # Limit scrolling to prevent infinite loops
+        
+        while scroll_attempts < max_scrolls:
+            # Get current scroll height
+            current_height = await self._page.evaluate("document.body.scrollHeight")
+            
+            if current_height == prev_height:
+                break  # No more content to load
+            
+            prev_height = current_height
+            
+            # Scroll down
+            await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await asyncio.sleep(0.5)  # Wait for lazy content to load
+            
+            # Try to click any "show more" buttons that appeared
+            for pattern in more_button_patterns:
+                try:
+                    locator = self._page.locator(pattern)
+                    if await locator.count() > 0:
+                        # Click all visible "more" buttons
+                        for i in range(min(await locator.count(), 5)):  # Max 5 clicks per pattern
+                            try:
+                                btn = locator.nth(i)
+                                if await btn.is_visible():
+                                    await btn.click(timeout=2000)
+                                    await asyncio.sleep(0.3)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            
+            scroll_attempts += 1
+        
+        # Scroll back to top
+        await self._page.evaluate("window.scrollTo(0, 0)")
+        await asyncio.sleep(0.3)
+        
+        # Final wait for any remaining content
+        try:
+            await self._page.wait_for_load_state("networkidle", timeout=3000)
+        except Exception:
+            pass
 
     async def _action_wait(self, payload: dict) -> dict[str, Any]:
         """Wait for an element or time."""
