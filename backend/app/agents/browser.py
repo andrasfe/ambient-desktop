@@ -341,9 +341,10 @@ class BrowserAgent(BaseAgent):
         }
         
         if not selector:
-            # Extract all visible text (truncated for safety)
+            # Extract all visible text (limit to 50KB for safety)
             text = await self._page.inner_text("body")
-            return {"text": text[:5000], "truncated": len(text) > 5000, **page_info}
+            max_len = 50000  # 50KB should be enough for most pages
+            return {"text": text[:max_len], "truncated": len(text) > max_len, **page_info}
         
         try:
             # Check if element exists with timeout
