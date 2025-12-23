@@ -87,7 +87,24 @@ async def chat_websocket(websocket: WebSocket):
                     full_response = f"Error processing message: {str(inner_e)}"
                 
                 print(f"[CHAT-WS] Response preview: {full_response[:200]}...")
-                # Note: Response is already broadcast from summarize_node, no need to send again
+                
+                # Also send directly to this client as backup
+                # (broadcast from summarize_node goes to all, but this ensures delivery)
+                if full_response and not full_response.startswith("{"):
+                    # Only send if it's not raw JSON (coordinator plan)
+                    try:
+                        await ws_manager.send_event(
+                            client_id,
+                            EventType.CHAT_MESSAGE,
+                            {
+                                "role": "assistant",
+                                "content": full_response,
+                                "session_id": msg_session,
+                            },
+                        )
+                        print(f"[CHAT-WS] ✅ Backup message sent")
+                    except Exception as send_err:
+                        print(f"[CHAT-WS] Backup send failed: {send_err}")
                 
             except Exception as e:
                 import traceback

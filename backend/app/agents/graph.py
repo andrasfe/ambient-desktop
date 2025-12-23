@@ -376,7 +376,30 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
             }
         except json.JSONDecodeError as je:
             print(f"[COORDINATOR] ⚠️ JSON parse failed: {je}")
-            print(f"[COORDINATOR] ⚠️ Content was: {content[:300]}...")
+            print(f"[COORDINATOR] ⚠️ Content was: {content[:500]}...")
+            print(f"[COORDINATOR] ⚠️ Content length: {len(content)}, error at pos: {je.pos}")
+            
+            # Try to extract JSON from anywhere in the content
+            import re
+            json_match = re.search(r'\{[\s\S]*\}', content)
+            if json_match:
+                try:
+                    extracted_json = json_match.group(0)
+                    parsed = json.loads(extracted_json)
+                    subtasks = parsed.get("subtasks", [])
+                    response_text = parsed.get("response", "Executing tasks...")
+                    print(f"[COORDINATOR] ✅ Recovered JSON with {len(subtasks)} subtasks")
+                    
+                    if subtasks:
+                        return {
+                            "messages": [AIMessage(content=response_text)],
+                            "subtasks": subtasks,
+                            "current_subtask_index": 0,
+                            "next_action": subtasks[0].get("agent", "end"),
+                            "coordinator_id": coordinator_id,
+                        }
+                except Exception as recover_err:
+                    print(f"[COORDINATOR] ⚠️ JSON recovery failed: {recover_err}")
             await ws_manager.broadcast(
                 EventType.AGENT_UPDATE,
                 {
