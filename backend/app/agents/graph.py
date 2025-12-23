@@ -12,6 +12,7 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Base
 
 from ..config import settings
 from ..services.websocket import ws_manager, EventType
+from .browser import BrowserAgent
 
 
 class AgentState(TypedDict):
@@ -94,79 +95,66 @@ def sanitize_for_llm(data: dict) -> dict:
 # System prompts
 COORDINATOR_SYSTEM_PROMPT = """You are an AI coordinator that orchestrates computer automation tasks.
 
-You can delegate work to specialized agents:
+CRITICAL RULE: Check the CURRENT BROWSER STATE section below before planning any actions.
+If the page you need is ALREADY OPEN, just extract - DO NOT navigate or click unnecessarily!
 
-BROWSER agent actions (use these exact action names):
+BROWSER agent actions:
+- "extract" - Extract text from current page. params: {} (empty = get all visible text)
+- "switch_tab" - Switch to a tab. params: {"url_contains": "linkedin.com"} or {"index": 0}
+- "scroll" - Scroll page. params: {"direction": "down"} or {"section": "Patents"}
+- "click" - Click an element. params: {"text": "button text"} (prefer text over selectors)
 - "navigate" - Go to a URL. params: {"url": "https://..."}
-- "click" - Click an element. params: {"selector": "css selector"} or {"text": "button text"}
-- "type" - Type into input. params: {"selector": "input selector", "text": "text to type"}
-- "extract" - Extract text from page. params: {"selector": "css selector", "target_url": "url pattern to match"} or {} for current page
-- "screenshot" - Take screenshot. params: {} or {"selector": "element to capture"}
-- "scroll" - Scroll page. params: {"direction": "down|up", "amount": 500} or {"selector": "element to scroll to"}
-- "wait" - Wait for element. params: {"selector": "css selector", "timeout": 5000}
-- "list_tabs" - List all open browser tabs. params: {}
-- "switch_tab" - Switch to a tab. params: {"index": 0} or {"url_contains": "linkedin.com"}
+- "type" - Type into input. params: {"selector": "input", "text": "text"}
+- "screenshot" - Take screenshot. params: {}
+- "list_tabs" - List open tabs. params: {}
 
 FILE agent actions:
 - "read" - Read file. params: {"path": "/path/to/file"}
 - "write" - Write file. params: {"path": "/path/to/file", "content": "..."}
 - "list" - List directory. params: {"path": "/path/to/dir"}
 
-When a user asks you to do something:
-1. Analyze the request
-2. Break it into subtasks using the EXACT action names above
-3. Specify which agent should handle each subtask
+DECISION FLOW:
+1. READ the "CURRENT BROWSER STATE" section carefully
+2. If the content user wants is ALREADY on the current page → just "extract" with {}
+3. If wrong tab → "switch_tab" then "extract"
+4. Only use scroll/click/navigate if the content isn't visible yet
 
-IMPORTANT WORKFLOW RULES:
-- To work with a specific website (e.g. LinkedIn), FIRST use switch_tab with url_contains to select that tab
-- Then perform extract/click/etc actions
-- Example: extract from LinkedIn = switch_tab(url_contains="linkedin") → extract
-- For extraction, use {} (empty params) to get full page text if you're not sure about selectors
-- Different pages have different content - a feed page is NOT the same as a profile page
-- If user asks about "their LinkedIn profile", they likely mean their profile page (linkedin.com/in/...), not the feed
+SIMPLE EXTRACTION (most common case):
+- User says "get patents from LinkedIn" and LinkedIn profile is already open?
+  → Just: [{"agent": "browser", "action": "extract", "params": {}}]
+- Don't add scroll/click/navigate unless truly needed!
 
-WEBSITE-SPECIFIC TIPS:
-- LinkedIn feed (/feed/) shows posts, not profile info
-- LinkedIn profile (/in/username) shows name, title, experience, patents, etc.
-- To find current user's profile from feed: click profile picture or "Me" menu
-- To extract profile info: first navigate to profile page, then extract
-
-LINKEDIN PATENT EXTRACTION:
-- Patents are in a collapsible section on LinkedIn profiles
-- Step 1: Navigate to the profile URL (linkedin.com/in/username)
-- Step 2: Scroll to the Patents section using: {"section": "Patents", "direction": "down"}
-- Step 3: Click to expand if needed using text: {"text": "Show all patents"} or {"text": "patents"}
-- Step 4: Extract with empty params {} to get all visible text, NOT with complex selectors
-- NEVER use complex CSS selectors like [data-section='patents'] - they don't work on LinkedIn
-
-SELECTOR GUIDELINES:
-- Prefer text-based clicking: {"text": "Patents"} over {"selector": ".patents-class"}
-- For extraction, use {} (empty params) to get full page text
-- If you need to scroll to a section, use {"section": "Patents"} not complex selectors
-- Simple is better: {"text": "Show all"} works better than {"selector": "button.show-all"}
+WHEN TO NAVIGATE:
+- Only if the URL shows a completely different page than what user needs
+- LinkedIn feed (/feed/) ≠ profile (/in/username) - may need to navigate
+- But if profile is already open, DON'T navigate again
 
 Respond with a JSON object:
 {
     "understanding": "Brief summary of what user wants",
     "subtasks": [
         {
-            "agent": "browser|file|mcp",
-            "action": "exact action name from list above",
-            "params": { ... parameters ... }
+            "agent": "browser|file",
+            "action": "action name",
+            "params": { ... }
         }
     ],
     "response": "What to tell the user"
 }
 
-If no action is needed (just chatting), respond with:
-{
-    "understanding": "User is just chatting",
-    "subtasks": [],
-    "response": "Your conversational response"
-}
+EXAMPLES:
 
-IMPORTANT: Use ONLY the action names listed above. Do NOT invent new actions.
-NEVER output raw tool-call markup like `<|tool_call_begin|>` / `<|tool_calls_section_begin|>`; always output the JSON plan format described above."""
+User: "extract patents from linkedin" (and LinkedIn profile is already the active tab)
+→ {"subtasks": [{"agent": "browser", "action": "extract", "params": {}}]}
+
+User: "get info from linkedin" (but active tab is CNN)
+→ {"subtasks": [{"agent": "browser", "action": "switch_tab", "params": {"url_contains": "linkedin"}}, {"agent": "browser", "action": "extract", "params": {}}]}
+
+IMPORTANT: 
+- Use ONLY the action names listed above
+- Check current browser state BEFORE planning navigation
+- Prefer minimal actions - if content is already visible, just extract!
+- NEVER output raw tool-call markup"""
 
 # Some OpenRouter models sometimes emit raw "tool call" markup (e.g. <|tool_call_begin|>).
 # Our workflow expects JSON plans; we defensively parse that markup into subtasks if it appears.
@@ -215,7 +203,33 @@ async def coordinator_node(state: AgentState) -> dict:
     try:
         llm = create_llm()
         
-        messages = [SystemMessage(content=COORDINATOR_SYSTEM_PROMPT)] + state["messages"]
+        # Get current browser context to help coordinator understand what's already visible
+        browser_context = ""
+        try:
+            browser_agent = BrowserAgent()
+            await browser_agent.start()
+            pages = await browser_agent.list_pages()  # Returns list of dicts
+            await browser_agent.stop()
+            
+            if pages and len(pages) > 0:
+                current_page = pages[0]  # Active tab (first in list)
+                all_tabs = "\n".join([f"  - Tab {p['index']}: {p.get('title', 'untitled')} ({p.get('url', '')})" for p in pages])
+                browser_context = f"""
+CURRENT BROWSER STATE:
+- Active tab: {current_page.get('title', 'unknown')}
+- Active URL: {current_page.get('url', 'unknown')}
+- All open tabs:
+{all_tabs}
+
+IMPORTANT: Check if the content user wants is ALREADY visible on the active tab.
+If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab" first.
+"""
+                print(f"[COORDINATOR] Browser context: Active tab = {current_page.get('url')}")
+        except Exception as e:
+            print(f"[COORDINATOR] Could not get browser context: {e}")
+        
+        system_content = COORDINATOR_SYSTEM_PROMPT + browser_context
+        messages = [SystemMessage(content=system_content)] + state["messages"]
         
         await ws_manager.broadcast_log(
             level="info",
