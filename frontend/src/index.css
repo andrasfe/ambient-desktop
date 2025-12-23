@@ -1,0 +1,108 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --color-void: #0a0a1a;
+  --color-surface: #12122a;
+  --color-surface-light: #1a1a3a;
+  --color-neon-cyan: #00ffff;
+  --color-neon-pink: #ff00ff;
+  --color-neon-green: #00ff88;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 0;
+  font-family: 'Space Grotesk', system-ui, sans-serif;
+  background: linear-gradient(135deg, var(--color-void) 0%, #0f0f2a 50%, #0a0a1a 100%);
+  color: #e0e8ff;
+  min-height: 100vh;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-void);
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(0, 255, 255, 0.3);
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 255, 255, 0.5);
+}
+
+/* Custom components */
+@layer components {
+  .glass {
+    background: rgba(18, 18, 42, 0.8);
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(0, 255, 255, 0.1);
+  }
+
+  .glass-hover:hover {
+    border-color: rgba(0, 255, 255, 0.3);
+  }
+
+  .neon-border {
+    border: 1px solid rgba(0, 255, 255, 0.3);
+    box-shadow: 0 0 10px rgba(0, 255, 255, 0.1);
+  }
+
+  .neon-text {
+    color: var(--color-neon-cyan);
+    text-shadow: 0 0 10px rgba(0, 255, 255, 0.5);
+  }
+
+  .btn-primary {
+    @apply px-4 py-2 rounded-lg font-medium transition-all duration-200;
+    background: linear-gradient(135deg, rgba(0, 255, 255, 0.2) 0%, rgba(255, 0, 255, 0.1) 100%);
+    border: 1px solid rgba(0, 255, 255, 0.3);
+  }
+
+  .btn-primary:hover {
+    background: linear-gradient(135deg, rgba(0, 255, 255, 0.3) 0%, rgba(255, 0, 255, 0.2) 100%);
+    box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
+  }
+
+  .input-field {
+    @apply w-full px-4 py-3 rounded-lg font-mono text-sm transition-all duration-200;
+    background: rgba(10, 10, 26, 0.8);
+    border: 1px solid rgba(0, 255, 255, 0.2);
+    color: #e0e8ff;
+  }
+
+  .input-field:focus {
+    outline: none;
+    border-color: rgba(0, 255, 255, 0.5);
+    box-shadow: 0 0 15px rgba(0, 255, 255, 0.2);
+  }
+
+  .input-field::placeholder {
+    color: rgba(224, 232, 255, 0.4);
+  }
+}
+
+/* Animation for streaming text */
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+.cursor-blink::after {
+  content: '▊';
+  animation: blink 1s step-end infinite;
+  color: var(--color-neon-cyan);
+}
+
