@@ -60,6 +60,50 @@ async def test_coordinator_tool_call_markup_parsing(monkeypatch):
     assert out["subtasks"][0]["params"]["url_contains"] == "linkedin.com"
 
 
+@pytest.mark.asyncio
+async def test_coordinator_deterministic_edit_swap_plan(monkeypatch):
+    """Coordinator should not 'extract' when user explicitly requests edit+swap; it should emit edit_fields."""
+    from app.agents import graph as graph_mod
+    from langchain_core.messages import HumanMessage
+
+    # If LLM is called, fail the test: deterministic planner should kick in
+    class _BoomLLM:
+        async def ainvoke(self, messages):
+            raise AssertionError("LLM should not be called for deterministic edit/swap plan")
+
+    monkeypatch.setattr(graph_mod, "create_llm", lambda: _BoomLLM())
+
+    state: graph_mod.AgentState = {
+        "messages": [
+            HumanMessage(
+                content=(
+                    "select the linkedin tab then search for the item titled US-11762974-B2, "
+                    "click the pencil next to it and swap the Patent Title with Patent Number values."
+                )
+            )
+        ],
+        "task_id": None,
+        "task_type": None,
+        "task_payload": None,
+        "subtasks": [],
+        "current_subtask_index": 0,
+        "results": [],
+        "agent_id": "test",
+        "session_id": "test",
+        "next_action": None,
+        "error": None,
+        "selected_tab_index": None,
+    }
+
+    out = await graph_mod.coordinator_node(state)
+    assert out["subtasks"], "Expected a deterministic plan"
+    assert out["subtasks"][0]["action"] == "switch_tab"
+    assert "linkedin" in out["subtasks"][0]["params"]["url_contains"]
+    assert out["subtasks"][1]["action"] == "edit_fields"
+    assert out["subtasks"][1]["params"]["match_text"] == "US-11762974-B2"
+    assert out["subtasks"][1]["params"]["swap"] == ["Patent Title", "Patent Number"]
+
+
 class TestSanitizeForLLM:
     """Tests for sanitize_for_llm function."""
 

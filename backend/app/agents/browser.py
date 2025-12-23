@@ -592,16 +592,67 @@ class BrowserAgent(BaseAgent):
         opened = False
         last_open_error: str | None = None
 
+        # 0) Prefer clicking an edit/pencil control near the matched item (generic DOM search).
+        # This follows the user's intent: "pencil next to it" on list/detail pages.
+        try:
+            clicked_near_item = await self._page.evaluate(
+                """
+                (matchText) => {
+                  const norm = (s) => (s || '').toString().replace(/\\s+/g,' ').trim().toLowerCase();
+                  const target = norm(matchText);
+                  // Find an element whose text includes matchText
+                  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_ELEMENT);
+                  let node = walker.currentNode;
+                  let found = null;
+                  while (node) {
+                    const t = norm(node.innerText);
+                    if (t && target && t.includes(target)) { found = node; break; }
+                    node = walker.nextNode();
+                  }
+                  if (!found) return { clicked: false, reason: 'match_not_found' };
+                  // Walk up a few ancestors and look for an edit control
+                  const re = /(edit|pencil|modify|change|update)/i;
+                  let cur = found;
+                  for (let depth = 0; depth < 7 && cur; depth++) {
+                    // candidates: buttons/links or anything with role=button
+                    const candidates = Array.from(cur.querySelectorAll('button, a, [role=\"button\"]'));
+                    for (const el of candidates) {
+                      const aria = el.getAttribute('aria-label') || '';
+                      const title = el.getAttribute('title') || '';
+                      const txt = el.innerText || '';
+                      if (re.test(aria) || re.test(title) || re.test(txt)) {
+                        el.click();
+                        return { clicked: true, via: 'near_item', hint: aria || title || txt };
+                      }
+                      // icon-only buttons sometimes only have svg; keep as fallback if label/title indicates edit
+                      if ((aria || title) && re.test(aria + ' ' + title)) {
+                        el.click();
+                        return { clicked: true, via: 'near_item_icon', hint: aria || title };
+                      }
+                    }
+                    cur = cur.parentElement;
+                  }
+                  return { clicked: false, reason: 'no_edit_control_near_item' };
+                }
+                """,
+                match_text,
+            )
+            if isinstance(clicked_near_item, dict) and clicked_near_item.get("clicked"):
+                opened = True
+        except Exception as e:
+            last_open_error = str(e)
+
         # 1) Try common edit button texts anywhere (generic)
-        for t in open_edit_texts:
-            try:
-                btn = self._page.get_by_role("button", name=t)
-                if await btn.count() > 0:
-                    await btn.first.click(timeout=3000)
-                    opened = True
-                    break
-            except Exception as e:
-                last_open_error = str(e)
+        if not opened:
+            for t in open_edit_texts:
+                try:
+                    btn = self._page.get_by_role("button", name=t)
+                    if await btn.count() > 0:
+                        await btn.first.click(timeout=3000)
+                        opened = True
+                        break
+                except Exception as e:
+                    last_open_error = str(e)
 
         # 2) Try aria-label patterns (generic)
         if not opened:

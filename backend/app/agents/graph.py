@@ -208,6 +208,95 @@ async def coordinator_node(state: AgentState) -> dict:
     )
     
     try:
+        # ---- Fast-path: deterministic planning for generic "edit/swap fields" requests ----
+        # We do this without an LLM to avoid the common failure mode of "extracting" instead of editing.
+        latest_user_text = ""
+        try:
+            # messages is a list[BaseMessage]; HumanMessage has .content
+            if state.get("messages"):
+                latest_user_text = state["messages"][-1].content or ""
+        except Exception:
+            latest_user_text = ""
+
+        def _extract_match_text(text: str) -> str | None:
+            # Prefer quoted strings first
+            m = re.search(r'"([^"]{3,100})"', text)
+            if m:
+                return m.group(1).strip()
+            m = re.search(r"'([^']{3,100})'", text)
+            if m:
+                return m.group(1).strip()
+            # Otherwise try to find an identifier-like token (letters+digits with dashes/underscores)
+            m = re.search(r"\b[A-Za-z]{1,6}[-_ ]?\d{3,}[-_A-Za-z0-9]{0,20}\b", text)
+            if m:
+                return m.group(0).strip()
+            return None
+
+        def _extract_swap_fields(text: str) -> tuple[str, str] | None:
+            # swap X with Y
+            m = re.search(r"\bswap\s+(?:the\s+)?(.+?)\s+with\s+(?:the\s+)?(.+?)(?:\s+values|\s+fields|\s*$)", text, re.IGNORECASE)
+            if m:
+                a = m.group(1).strip(" .,:;\"'()[]{}")
+                b = m.group(2).strip(" .,:;\"'()[]{}")
+                if a and b:
+                    return a, b
+            # swap X and Y
+            m = re.search(r"\bswap\s+(?:the\s+)?(.+?)\s+(?:and|<->)\s+(?:the\s+)?(.+?)(?:\s+values|\s+fields|\s*$)", text, re.IGNORECASE)
+            if m:
+                a = m.group(1).strip(" .,:;\"'()[]{}")
+                b = m.group(2).strip(" .,:;\"'()[]{}")
+                if a and b:
+                    return a, b
+            return None
+
+        wants_edit = bool(re.search(r"\b(edit|pencil|change|update|modify|fix)\b", latest_user_text, re.IGNORECASE))
+        wants_swap = bool(re.search(r"\bswap\b", latest_user_text, re.IGNORECASE))
+        swap_pair = _extract_swap_fields(latest_user_text) if wants_swap else None
+        match_text = _extract_match_text(latest_user_text) if (wants_edit or wants_swap) else None
+
+        if (wants_swap and swap_pair and match_text) or (wants_edit and match_text and swap_pair):
+            subtasks: list[dict] = []
+            # If the user referenced a specific tab/site, switch to it first.
+            if re.search(r"\blinkedin\b", latest_user_text, re.IGNORECASE):
+                subtasks.append({"agent": "browser", "action": "switch_tab", "params": {"url_contains": "linkedin"}})
+            else:
+                # Generic: if user says "active tab" or "current tab", don't switch.
+                pass
+
+            a, b = swap_pair
+            subtasks.append(
+                {
+                    "agent": "browser",
+                    "action": "edit_fields",
+                    "params": {
+                        "match_text": match_text,
+                        "swap": [a, b],
+                    },
+                }
+            )
+
+            await ws_manager.broadcast_log(
+                level="info",
+                message="Using deterministic edit/swap plan (no LLM) for reliability.",
+                category="coordinator",
+                details={"match_text": match_text, "swap": [a, b]},
+            )
+            await ws_manager.broadcast(
+                EventType.AGENT_UPDATE,
+                {
+                    "id": coordinator_id,
+                    "status": "busy",
+                    "summary": f"Delegating {len(subtasks)} task(s)",
+                },
+            )
+            return {
+                "messages": [AIMessage(content="Got it — I'll open the editor for that item and swap the two fields.")],
+                "subtasks": subtasks,
+                "current_subtask_index": 0,
+                "next_action": subtasks[0].get("agent", "end"),
+                "coordinator_id": coordinator_id,
+            }
+
         llm = create_llm()
         
         # Get current browser context to help coordinator understand what's already visible
