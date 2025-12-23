@@ -376,21 +376,23 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
             }
         except json.JSONDecodeError as je:
             print(f"[COORDINATOR] ⚠️ JSON parse failed: {je}")
-            print(f"[COORDINATOR] ⚠️ Content was: {content[:500]}...")
             print(f"[COORDINATOR] ⚠️ Content length: {len(content)}, error at pos: {je.pos}")
             
-            # Try to extract JSON from anywhere in the content
-            import re
-            json_match = re.search(r'\{[\s\S]*\}', content)
-            if json_match:
+            # Try to parse just up to the error position (likely extra data after valid JSON)
+            if je.pos and je.pos > 10:
                 try:
-                    extracted_json = json_match.group(0)
-                    parsed = json.loads(extracted_json)
+                    # Find the last closing brace before the error
+                    truncated = content[:je.pos].rstrip()
+                    parsed = json.loads(truncated)
                     subtasks = parsed.get("subtasks", [])
                     response_text = parsed.get("response", "Executing tasks...")
-                    print(f"[COORDINATOR] ✅ Recovered JSON with {len(subtasks)} subtasks")
+                    print(f"[COORDINATOR] ✅ Recovered JSON (truncated at {je.pos}) with {len(subtasks)} subtasks")
                     
                     if subtasks:
+                        await ws_manager.broadcast(
+                            EventType.AGENT_UPDATE,
+                            {"id": coordinator_id, "status": "busy", "summary": f"Delegating {len(subtasks)} task(s)"},
+                        )
                         return {
                             "messages": [AIMessage(content=response_text)],
                             "subtasks": subtasks,
@@ -399,7 +401,40 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
                             "coordinator_id": coordinator_id,
                         }
                 except Exception as recover_err:
-                    print(f"[COORDINATOR] ⚠️ JSON recovery failed: {recover_err}")
+                    print(f"[COORDINATOR] ⚠️ Truncated JSON recovery failed: {recover_err}")
+            
+            # Last resort: try to find balanced braces
+            try:
+                depth = 0
+                start = content.find('{')
+                if start >= 0:
+                    for i, c in enumerate(content[start:], start):
+                        if c == '{':
+                            depth += 1
+                        elif c == '}':
+                            depth -= 1
+                            if depth == 0:
+                                extracted = content[start:i+1]
+                                parsed = json.loads(extracted)
+                                subtasks = parsed.get("subtasks", [])
+                                response_text = parsed.get("response", "Executing tasks...")
+                                print(f"[COORDINATOR] ✅ Recovered JSON (balanced braces) with {len(subtasks)} subtasks")
+                                
+                                if subtasks:
+                                    await ws_manager.broadcast(
+                                        EventType.AGENT_UPDATE,
+                                        {"id": coordinator_id, "status": "busy", "summary": f"Delegating {len(subtasks)} task(s)"},
+                                    )
+                                    return {
+                                        "messages": [AIMessage(content=response_text)],
+                                        "subtasks": subtasks,
+                                        "current_subtask_index": 0,
+                                        "next_action": subtasks[0].get("agent", "end"),
+                                        "coordinator_id": coordinator_id,
+                                    }
+                                break
+            except Exception as brace_err:
+                print(f"[COORDINATOR] ⚠️ Balanced brace recovery failed: {brace_err}")
             await ws_manager.broadcast(
                 EventType.AGENT_UPDATE,
                 {
@@ -407,6 +442,11 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
                     "status": "idle",
                     "summary": "Conversational response",
                 },
+            )
+            # Remove from Active Agents
+            await ws_manager.broadcast(
+                EventType.AGENT_REMOVED,
+                {"id": coordinator_id},
             )
             # Just a conversational response - no subtasks to execute
             return {
@@ -717,7 +757,7 @@ async def summarize_node(state: AgentState) -> dict:
     coordinator_id = state.get("coordinator_id")
     
     if not results and not error:
-        # Mark coordinator as complete
+        # Mark coordinator as complete and remove
         if coordinator_id:
             await ws_manager.broadcast(
                 EventType.AGENT_UPDATE,
@@ -726,6 +766,10 @@ async def summarize_node(state: AgentState) -> dict:
                     "status": "idle",
                     "summary": "No tasks to execute",
                 },
+            )
+            await ws_manager.broadcast(
+                EventType.AGENT_REMOVED,
+                {"id": coordinator_id},
             )
         return {"next_action": "end"}
     
@@ -800,7 +844,7 @@ Provide a brief, user-friendly summary of what was done."""
     )
     print(f"[SUMMARIZE] Broadcast summary: {summary_text[:100]}...")
     
-    # Mark coordinator as complete
+    # Mark coordinator as complete and remove from UI
     if coordinator_id:
         await ws_manager.broadcast(
             EventType.AGENT_UPDATE,
@@ -809,6 +853,13 @@ Provide a brief, user-friendly summary of what was done."""
                 "status": "idle",
                 "summary": "Task completed",
             },
+        )
+        # Remove coordinator from Active Agents after a brief moment
+        import asyncio
+        await asyncio.sleep(0.5)
+        await ws_manager.broadcast(
+            EventType.AGENT_REMOVED,
+            {"id": coordinator_id},
         )
     
     return {
