@@ -62,17 +62,34 @@ class BrowserAgent(BaseAgent):
             self._browser = await self._playwright.chromium.connect_over_cdp(self.cdp_url)
             self._owns_browser = False
             
-            # Get the default context (user's existing session)
+            # Get all contexts from the browser
             contexts = self._browser.contexts
+            print(f"[BROWSER] CDP connected, found {len(contexts)} contexts")
+            
             if contexts:
                 self._context = contexts[0]
                 pages = self._context.pages
-                if pages:
-                    # Use the currently active page
+                print(f"[BROWSER] Context has {len(pages)} pages")
+                
+                # Find a non-blank, non-extension page to use as default
+                selected_page = None
+                for i, page in enumerate(pages):
+                    url = page.url
+                    print(f"[BROWSER]   Page {i}: {url[:80]}")
+                    # Skip blank, extension, and chrome internal pages
+                    if url and not url.startswith(('about:', 'chrome:', 'chrome-extension:')):
+                        if selected_page is None:
+                            selected_page = page
+                            print(f"[BROWSER]   -> Selected as default")
+                
+                if selected_page:
+                    self._page = selected_page
+                elif pages:
                     self._page = pages[0]
                 else:
                     self._page = await self._context.new_page()
             else:
+                print("[BROWSER] No contexts found, creating new one")
                 self._context = await self._browser.new_context()
                 self._page = await self._context.new_page()
             
@@ -157,10 +174,18 @@ class BrowserAgent(BaseAgent):
         
         pages = []
         for i, page in enumerate(self._context.pages):
+            url = page.url
+            # Skip blank, extension, and chrome internal pages
+            if url.startswith(('about:', 'chrome:', 'chrome-extension:')):
+                continue
+            try:
+                title = await page.title()
+            except:
+                title = "Unknown"
             pages.append({
                 "index": i,
-                "url": page.url,
-                "title": await page.title(),
+                "url": url,
+                "title": title,
             })
         return pages
 

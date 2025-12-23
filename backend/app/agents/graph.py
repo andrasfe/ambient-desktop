@@ -114,20 +114,24 @@ FILE agent actions:
 - "list" - List directory. params: {"path": "/path/to/dir"}
 
 DECISION FLOW:
-1. READ the "CURRENT BROWSER STATE" section carefully
-2. If the content user wants is ALREADY on the current page → just "extract" with {}
-3. If wrong tab → "switch_tab" then "extract"
-4. Only use scroll/click/navigate if the content isn't visible yet
+1. READ the "CURRENT BROWSER STATE" section - especially "Active URL" and "All open tabs"
+2. CHECK if the content user wants is on a DIFFERENT tab than the Active tab
+3. If content is on a different tab → MUST use "switch_tab" FIRST
+4. Then use "extract" to get the content
 
-SIMPLE EXTRACTION (most common case):
-- User says "get patents from LinkedIn" and LinkedIn profile is already open?
-  → Just: [{"agent": "browser", "action": "extract", "params": {}}]
-- Don't add scroll/click/navigate unless truly needed!
+CRITICAL TAB SWITCHING:
+- Look at "Active URL" - this is where actions will happen
+- Look at "All open tabs" - user might want content from a different tab
+- If user asks for "linkedin" content but Active URL is NOT linkedin → switch_tab first!
+- Example: Active=openrouter.ai, user wants LinkedIn → [switch_tab, extract]
 
-WHEN TO NAVIGATE:
-- Only if the URL shows a completely different page than what user needs
-- LinkedIn feed (/feed/) ≠ profile (/in/username) - may need to navigate
-- But if profile is already open, DON'T navigate again
+EXAMPLES:
+User: "extract from linkedin" (Active URL: openrouter.ai, Tab 3 is linkedin)
+→ [{"agent": "browser", "action": "switch_tab", "params": {"url_contains": "linkedin"}},
+   {"agent": "browser", "action": "extract", "params": {}}]
+
+User: "get text from current page" (any active URL)
+→ [{"agent": "browser", "action": "extract", "params": {}}]
 
 Respond with a JSON object:
 {
@@ -225,8 +229,11 @@ IMPORTANT: Check if the content user wants is ALREADY visible on the active tab.
 If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab" first.
 """
                 print(f"[COORDINATOR] Browser context: Active tab = {current_page.get('url')}")
+                print(f"[COORDINATOR] Full browser_context:\n{browser_context}")
         except Exception as e:
+            import traceback
             print(f"[COORDINATOR] Could not get browser context: {e}")
+            traceback.print_exc()
         
         system_content = COORDINATOR_SYSTEM_PROMPT + browser_context
         messages = [SystemMessage(content=system_content)] + state["messages"]
