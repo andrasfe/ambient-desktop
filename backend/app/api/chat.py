@@ -87,34 +87,7 @@ async def chat_websocket(websocket: WebSocket):
                     full_response = f"Error processing message: {str(inner_e)}"
                 
                 print(f"[CHAT-WS] Response preview: {full_response[:200]}...")
-                
-                # Send the response to the client
-                if full_response:
-                    print(f"[CHAT] About to send response to client {client_id}...")
-                    success = await ws_manager.send_event(
-                        client_id,
-                        EventType.CHAT_MESSAGE,
-                        {
-                            "role": "assistant",
-                            "content": full_response,
-                            "session_id": msg_session,
-                        },
-                    )
-                    if success:
-                        print(f"[CHAT] ✅ Message sent successfully to client {client_id}")
-                    else:
-                        print(f"[CHAT] ❌ Failed to send message - client {client_id} not found/disconnected")
-                else:
-                    print(f"[CHAT] WARNING: Empty response!")
-                    await ws_manager.send_event(
-                        client_id,
-                        EventType.CHAT_MESSAGE,
-                        {
-                            "role": "assistant",
-                            "content": "I processed your request but couldn't generate a response. Please try again.",
-                            "session_id": msg_session,
-                        },
-                    )
+                # Note: Response is already broadcast from summarize_node, no need to send again
                 
             except Exception as e:
                 import traceback

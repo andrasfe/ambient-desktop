@@ -717,18 +717,41 @@ async def summarize_node(state: AgentState) -> dict:
             },
         )
     
-    # Create a summary prompt
-    summary_prompt = f"""Summarize what was accomplished:
+    # Create a summary prompt that preserves data
+    # Convert results to a more readable format
+    results_str = str(results)
+    
+    # Check if results contain extracted text (likely has actual content to show)
+    has_extracted_text = any(
+        isinstance(r, dict) and ("text" in r or "results" in r)
+        for r in results if isinstance(r, dict)
+    )
+    
+    if has_extracted_text:
+        # User likely wants to see the actual data
+        summary_prompt = f"""The user requested data extraction. Here are the results:
+
+{results_str[:80000]}
+
+Create a response that:
+1. Briefly describes what was done (1-2 sentences)
+2. INCLUDES THE ACTUAL EXTRACTED DATA - lists, titles, text, etc.
+3. If there's a list of items (like patent titles, names, etc.), format them clearly
+4. Don't just say "found X items" - SHOW the items
+
+{"Error encountered: " + error if error else ""}"""
+    else:
+        summary_prompt = f"""Summarize what was accomplished:
 
 Results:
-{results}
+{results_str[:20000]}
 
 {"Error: " + error if error else ""}
 
 Provide a brief, user-friendly summary of what was done."""
 
     messages = [
-        SystemMessage(content="You are a helpful assistant summarizing task results."),
+        SystemMessage(content="You are a helpful assistant. When data was extracted, ALWAYS include the actual data in your response, not just a summary of it."),
         HumanMessage(content=summary_prompt),
     ]
     
