@@ -161,6 +161,8 @@ class BrowserAgent(BaseAgent):
             raise ValueError(f"Page index {page_index} out of range (have {len(pages)} pages)")
         
         self._page = pages[page_index]
+        # Bring the tab to the foreground in the browser UI
+        await self._page.bring_to_front()
         return {
             "url": self._page.url,
             "title": await self._page.title(),

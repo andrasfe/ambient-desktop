@@ -70,11 +70,9 @@ export function useWebSocket() {
         break;
 
       case 'chat:stream_end':
-        const streamContent = useAgentStore.getState().streamingContent;
-        if (streamContent) {
-          addMessage({ role: 'assistant', content: streamContent });
-          clearStreaming();
-        }
+        // Just clear streaming state - the actual message comes via chat:message
+        // to avoid duplicates
+        clearStreaming();
         break;
 
       case 'agent:created':
