@@ -937,18 +937,9 @@ Provide a brief, user-friendly summary of what was done."""
         category="coordinator",
     )
     
-    # Broadcast the summary as a chat message to ALL clients
-    # This ensures delivery even if the original WebSocket had issues
-    session_id = state.get("session_id", "default")
-    await ws_manager.broadcast(
-        EventType.CHAT_MESSAGE,
-        {
-            "role": "assistant",
-            "content": summary_text,
-            "session_id": session_id,
-        },
-    )
-    print(f"[SUMMARIZE] Broadcast summary: {summary_text[:100]}...")
+    # NOTE: Do NOT broadcast chat messages from inside the graph.
+    # Chat delivery is handled by the WebSocket endpoint, which can target the correct client/session
+    # and avoids duplicate messages.
     
     # Mark coordinator as complete and remove from UI
     if coordinator_id:
