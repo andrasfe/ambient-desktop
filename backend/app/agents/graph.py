@@ -712,12 +712,26 @@ Provide a brief, user-friendly summary of what was done."""
     ]
     
     response = await llm.ainvoke(messages)
+    summary_text = response.content if hasattr(response, "content") else str(response)
     
     await ws_manager.broadcast_log(
         level="info",
         message="Task execution completed",
         category="coordinator",
     )
+    
+    # Broadcast the summary as a chat message to ALL clients
+    # This ensures delivery even if the original WebSocket had issues
+    session_id = state.get("session_id", "default")
+    await ws_manager.broadcast(
+        EventType.CHAT_MESSAGE,
+        {
+            "role": "assistant",
+            "content": summary_text,
+            "session_id": session_id,
+        },
+    )
+    print(f"[SUMMARIZE] Broadcast summary: {summary_text[:100]}...")
     
     # Mark coordinator as complete
     if coordinator_id:
