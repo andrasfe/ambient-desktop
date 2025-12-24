@@ -15,6 +15,9 @@ from ..services.websocket import ws_manager, EventType
 
 # Browser-use for AI-native browser automation
 from browser_use import Agent as BrowserUseAgent, Browser as BrowserUseBrowser
+# Browser-use has its own LLM wrappers that are required for its Agent
+from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
+from browser_use.llm.ollama.chat import ChatOllama as BrowserUseChatOllama
 
 
 class AgentState(TypedDict):
@@ -54,9 +57,9 @@ class AgentState(TypedDict):
 
 
 def create_llm():
-    """Create the LLM instance (OpenRouter, Ollama, or any OpenAI-compatible API)."""
+    """Create the LLM instance for LangGraph coordinator (uses langchain ChatOpenAI)."""
     
-    # Check if using local LLM (Ollama)
+    # Check if using local LLM (Ollama/LMStudio)
     if settings.is_local_llm:
         return ChatOpenAI(
             model=settings.openrouter_model,
@@ -75,6 +78,34 @@ def create_llm():
             "X-Title": "Ambient Desktop Agent",
         },
         temperature=0.7,
+    )
+
+
+def create_browser_use_llm():
+    """Create the LLM instance for browser-use Agent (uses browser-use's own LLM classes)."""
+    
+    # Check if using local LLM (Ollama/LMStudio)
+    if settings.is_local_llm:
+        # LMStudio uses OpenAI-compatible API, so we can use Ollama client with custom host
+        # Extract host from base URL (e.g., "http://localhost:1234/v1" -> "http://localhost:1234")
+        base_url = settings.openrouter_base_url
+        if base_url and base_url.endswith("/v1"):
+            base_url = base_url[:-3]  # Remove /v1 suffix
+        
+        return BrowserUseChatOllama(
+            model=settings.openrouter_model,
+            host=base_url,
+        )
+    
+    # Cloud API (OpenRouter) - use browser-use's ChatOpenAI with custom base_url
+    return BrowserUseChatOpenAI(
+        model=settings.openrouter_model,
+        api_key=settings.openrouter_api_key,
+        base_url=settings.openrouter_base_url,
+        default_headers={
+            "HTTP-Referer": "https://ambient-desktop.local",
+            "X-Title": "Ambient Desktop Agent",
+        },
     )
 
 
@@ -730,8 +761,8 @@ async def _run_browser_use_task(action: str, params: dict, original_question: st
     
     action_lower = action.lower()
     
-    # Create LLM for browser-use
-    llm = create_llm()
+    # Create LLM for browser-use (uses browser-use's own LLM classes)
+    llm = create_browser_use_llm()
     
     browser = None
     try:
