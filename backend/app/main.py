@@ -11,7 +11,7 @@ from .database import init_db, close_db
 from .services.scheduler import scheduler
 from .services.websocket import ws_manager
 from .api import chat_router, tasks_router, agents_router
-from .agents import BrowserAgent, FileAgent
+from .agents import FileAgent
 
 
 @asynccontextmanager
@@ -29,15 +29,7 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         print(f"⚠️  Database initialization skipped: {e}")
     
-    # Register task handlers with scheduler (lazy - agents created on demand)
-    async def handle_browser_task(task):
-        agent = BrowserAgent()
-        await agent.start()
-        try:
-            return await agent.execute(task)
-        finally:
-            await agent.stop()
-    
+    # Register task handlers with scheduler (browser handled via browser-use in graph)
     async def handle_file_task(task):
         agent = FileAgent()
         await agent.start()
@@ -46,7 +38,6 @@ async def lifespan(app: FastAPI):
         finally:
             await agent.stop()
     
-    scheduler.register_handler("browser", handle_browser_task)
     scheduler.register_handler("file", handle_file_task)
     
     # Start scheduler

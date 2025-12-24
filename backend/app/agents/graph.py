@@ -13,18 +13,8 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Base
 from ..config import settings
 from ..services.websocket import ws_manager, EventType
 
-# Import legacy BrowserAgent for fallback and browser context detection
-from .browser import BrowserAgent
-
-# Browser-use is used for AI-native browser automation
-# Falls back to custom BrowserAgent if browser-use is not available
-try:
-    from browser_use import Agent as BrowserUseAgent, Browser as BrowserUseBrowser
-    BROWSER_USE_AVAILABLE = True
-except ImportError:
-    BROWSER_USE_AVAILABLE = False
-    BrowserUseAgent = None
-    BrowserUseBrowser = None
+# Browser-use for AI-native browser automation
+from browser_use import Agent as BrowserUseAgent, Browser as BrowserUseBrowser
 
 
 class AgentState(TypedDict):
@@ -280,26 +270,29 @@ async def coordinator_node(state: AgentState) -> dict:
         # Get current browser context to help coordinator understand what's already visible
         browser_context = ""
         try:
-            browser_agent = BrowserAgent()
-            await browser_agent.start()
-            pages = await browser_agent.list_pages()  # Returns list of dicts
-            await browser_agent.stop()
-            
-            if pages and len(pages) > 0:
-                current_page = pages[0]  # Active tab (first in list)
-                all_tabs = "\n".join([f"  - Tab {p['index']}: {p.get('title', 'untitled')} ({p.get('url', '')})" for p in pages])
-                browser_context = f"""
+            if settings.browser_cdp_url:
+                browser = BrowserUseBrowser(cdp_url=settings.browser_cdp_url)
+                await browser.start()
+                
+                current_url = await browser.get_current_page_url()
+                current_title = await browser.get_current_page_title()
+                tabs = await browser.get_tabs()
+                
+                await browser.stop()
+                
+                if current_url:
+                    tabs_info = "\n".join([f"  - Tab {i}: {t.get('title', 'untitled')} ({t.get('url', '')})" for i, t in enumerate(tabs or [])])
+                    browser_context = f"""
 CURRENT BROWSER STATE:
-- Active tab: {current_page.get('title', 'unknown')}
-- Active URL: {current_page.get('url', 'unknown')}
+- Active tab: {current_title or 'unknown'}
+- Active URL: {current_url or 'unknown'}
 - All open tabs:
-{all_tabs}
+{tabs_info}
 
 IMPORTANT: Check if the content user wants is ALREADY visible on the active tab.
 If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab" first.
 """
-                print(f"[COORDINATOR] Browser context: Active tab = {current_page.get('url')}")
-                print(f"[COORDINATOR] Full browser_context:\n{browser_context}")
+                    print(f"[COORDINATOR] Browser context: Active tab = {current_url}")
         except Exception as e:
             import traceback
             print(f"[COORDINATOR] Could not get browser context: {e}")
@@ -599,64 +592,59 @@ async def browser_node(state: AgentState) -> dict:
             break
     
     try:
+        # Use browser-use with automatic retry loop on incomplete results
+        max_retries = 3
+        retry_count = 0
+        accumulated_instructions = ""
         result = None
         
-        if BROWSER_USE_AVAILABLE:
-            # Use browser-use with automatic retry loop on incomplete results
-            max_retries = 3
-            retry_count = 0
-            accumulated_instructions = ""
+        while retry_count <= max_retries:
+            # Build refined question with any accumulated instructions from previous attempts
+            refined_question = original_question
+            if accumulated_instructions:
+                refined_question = f"{original_question}\n\nADDITIONAL INSTRUCTIONS (based on previous attempt feedback):\n{accumulated_instructions}"
             
-            while retry_count <= max_retries:
-                # Build refined question with any accumulated instructions from previous attempts
-                refined_question = original_question
-                if accumulated_instructions:
-                    refined_question = f"{original_question}\n\nADDITIONAL INSTRUCTIONS (based on previous attempt feedback):\n{accumulated_instructions}"
+            result = await _run_browser_use_task(action, params, refined_question)
+            result_text = result.get("text", "") if result else ""
+            
+            # Check if result indicates incomplete/failed extraction
+            incomplete_indicators = [
+                "no patent" in result_text.lower(),
+                "0 patent" in result_text.lower(),
+                "not found" in result_text.lower(),
+                "did not successfully" in result_text.lower(),
+                "were not properly" in result_text.lower(),
+                "recommendation" in result_text.lower() and "re-run" in result_text.lower(),
+            ]
+            
+            is_incomplete = any(incomplete_indicators) and len(result_text) < 5000
+            
+            if is_incomplete and result.get("success") and retry_count < max_retries:
+                retry_count += 1
                 
-                result = await _run_browser_use_task(action, params, refined_question)
-                result_text = result.get("text", "") if result else ""
+                # Extract recommendation from the response
+                recommendation = _extract_recommendation_from_response(result_text)
                 
-                # Check if result indicates incomplete/failed extraction
-                incomplete_indicators = [
-                    "no patent" in result_text.lower(),
-                    "0 patent" in result_text.lower(),
-                    "not found" in result_text.lower(),
-                    "did not successfully" in result_text.lower(),
-                    "were not properly" in result_text.lower(),
-                    "recommendation" in result_text.lower() and "re-run" in result_text.lower(),
-                ]
-                
-                is_incomplete = any(incomplete_indicators) and len(result_text) < 5000
-                
-                if is_incomplete and result.get("success") and retry_count < max_retries:
-                    retry_count += 1
-                    
-                    # Extract recommendation from the response
-                    recommendation = _extract_recommendation_from_response(result_text)
-                    
-                    if recommendation:
-                        accumulated_instructions = recommendation
-                        await ws_manager.broadcast_log(
-                            level="info",
-                            message=f"[Retry {retry_count}/{max_retries}] Applying browser-use recommendation: {recommendation[:80]}...",
-                            category="browser",
-                        )
-                        print(f"[BROWSER-USE] Retry {retry_count}: {recommendation[:100]}...")
-                    else:
-                        # No clear recommendation, use default aggressive instructions
-                        accumulated_instructions = "Scroll through the ENTIRE page from top to bottom. Click ALL 'Show more', 'Load more', 'Show all' buttons you find. Wait for content to load after each click. Extract ALL items visible on the page."
-                        await ws_manager.broadcast_log(
-                            level="info",
-                            message=f"[Retry {retry_count}/{max_retries}] Retrying with aggressive scroll/expand instructions",
-                            category="browser",
-                        )
-                    continue
+                if recommendation:
+                    accumulated_instructions = recommendation
+                    await ws_manager.broadcast_log(
+                        level="info",
+                        message=f"[Retry {retry_count}/{max_retries}] Applying browser-use recommendation: {recommendation[:80]}...",
+                        category="browser",
+                    )
+                    print(f"[BROWSER-USE] Retry {retry_count}: {recommendation[:100]}...")
                 else:
-                    # Result looks complete or we've exhausted retries
-                    break
-        else:
-            # Fallback to custom BrowserAgent if browser-use not available
-            result = await _run_legacy_browser_task(state, subtask)
+                    # No clear recommendation, use default aggressive instructions
+                    accumulated_instructions = "Scroll through the ENTIRE page from top to bottom. Click ALL 'Show more', 'Load more', 'Show all' buttons you find. Wait for content to load after each click. Extract ALL items visible on the page."
+                    await ws_manager.broadcast_log(
+                        level="info",
+                        message=f"[Retry {retry_count}/{max_retries}] Retrying with aggressive scroll/expand instructions",
+                        category="browser",
+                    )
+                continue
+            else:
+                # Result looks complete or we've exhausted retries
+                break
         
         results = state.get("results", [])
         results.append({"subtask": subtask, "result": result})
@@ -844,63 +832,6 @@ Important instructions:
                 await browser.close()
             except Exception:
                 pass
-
-
-async def _run_legacy_browser_task(state: dict, subtask: dict) -> dict:
-    """Fallback: Run task using legacy custom BrowserAgent."""
-    from .browser import BrowserAgent
-    import asyncio
-    
-    action = subtask.get("action", "")
-    params = subtask.get("params", {})
-    action_lower = action.lower()
-    
-    agent = BrowserAgent(
-        cdp_url=settings.browser_cdp_url or None,
-        user_data_dir=settings.browser_user_data_dir or None,
-        headless=settings.browser_headless,
-    )
-    
-    try:
-        await agent.start()
-        
-        if "navigate" in action_lower:
-            url = params.get("url", params.get("target", ""))
-            return await agent.navigate(url) if url else {"error": "No URL provided"}
-            
-        elif "click" in action_lower:
-            return await agent.click(
-                selector=params.get("selector"),
-                text=params.get("text", params.get("description", "")),
-            )
-            
-        elif "type" in action_lower or "input" in action_lower:
-            return await agent.type_text(
-                params.get("selector", ""),
-                params.get("text", params.get("value", "")),
-            )
-            
-        elif "extract" in action_lower:
-            return await agent.extract(
-                selector=params.get("selector"),
-                attribute=params.get("attribute"),
-                all=params.get("all", False),
-            )
-            
-        elif "screenshot" in action_lower:
-            return await agent.screenshot()
-            
-        elif "scroll" in action_lower:
-            return await agent.scroll(
-                direction=params.get("direction", "down"),
-                amount=int(params.get("amount", 500) or 500),
-            )
-            
-        else:
-            return {"error": f"Unknown action: {action}"}
-            
-    finally:
-        await agent.stop()
 
 
 async def file_node(state: AgentState) -> dict:
