@@ -1,7 +1,48 @@
-import { useState, useRef, useEffect } from 'react';
-import { Send, Bot, User, Loader2, Copy, Check } from 'lucide-react';
+import { useState, useRef, useEffect, Component, ReactNode } from 'react';
+import { Send, Bot, User, Loader2, Copy, Check, StopCircle, AlertTriangle } from 'lucide-react';
 import { useAgentStore } from '../stores/agentStore';
 import clsx from 'clsx';
+
+// Error boundary to catch rendering errors
+class ChatErrorBoundary extends Component<
+  { children: ReactNode },
+  { hasError: boolean; error: Error | null }
+> {
+  constructor(props: { children: ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error('Chat error:', error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="flex flex-col items-center justify-center h-full text-void-400 p-4">
+          <AlertTriangle className="w-12 h-12 mb-4 text-red-500" />
+          <p className="text-center mb-4">Something went wrong displaying messages.</p>
+          <button
+            onClick={() => {
+              // Clear corrupted state
+              localStorage.removeItem('ambient-agent-storage');
+              window.location.reload();
+            }}
+            className="btn-primary px-4 py-2"
+          >
+            Reset & Reload
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
@@ -33,14 +74,16 @@ function CopyButton({ text }: { text: string }) {
 
 interface ChatProps {
   onSendMessage: (message: string) => void;
+  onCancelRequest?: () => void;
 }
 
-export function Chat({ onSendMessage }: ChatProps) {
+export function Chat({ onSendMessage, onCancelRequest }: ChatProps) {
   const [input, setInput] = useState('');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const messages = useAgentStore((state) => state.messages);
   const streamingContent = useAgentStore((state) => state.streamingContent);
   const connected = useAgentStore((state) => state.connected);
+  const isProcessing = useAgentStore((state) => state.isProcessing);
   const activeSession = useAgentStore((state) => 
     state.sessions.find((s) => s.id === state.activeSessionId)
   );
@@ -78,6 +121,7 @@ export function Chat({ onSendMessage }: ChatProps) {
 
       {/* Messages */}
       <div className="flex-1 overflow-y-auto p-4 space-y-4">
+        <ChatErrorBoundary>
         {messages.length === 0 && !streamingContent && (
           <div className="flex flex-col items-center justify-center h-full text-void-500">
             <Bot className="w-16 h-16 mb-4 opacity-30" />
@@ -123,10 +167,12 @@ export function Chat({ onSendMessage }: ChatProps) {
                 <CopyButton text={msg.content} />
               </div>
               <p className="text-sm whitespace-pre-wrap font-mono leading-relaxed pr-6">
-                {msg.content}
+                {msg.content || ''}
               </p>
               <p className="text-[10px] text-void-500 mt-2">
-                {msg.timestamp.toLocaleTimeString()}
+                {msg.timestamp instanceof Date 
+                  ? msg.timestamp.toLocaleTimeString() 
+                  : new Date(msg.timestamp).toLocaleTimeString()}
               </p>
             </div>
           </div>
@@ -145,6 +191,7 @@ export function Chat({ onSendMessage }: ChatProps) {
             </div>
           </div>
         )}
+        </ChatErrorBoundary>
 
         <div ref={messagesEndRef} />
       </div>
@@ -157,19 +204,31 @@ export function Chat({ onSendMessage }: ChatProps) {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             placeholder={connected ? "Tell me what to do..." : "Connecting..."}
-            disabled={!connected}
+            disabled={!connected || isProcessing}
             className="input-field flex-1"
           />
-          <button
-            type="submit"
-            disabled={!connected || !input.trim()}
-            className={clsx(
-              'btn-primary px-6 flex items-center gap-2',
-              (!connected || !input.trim()) && 'opacity-50 cursor-not-allowed'
-            )}
-          >
-            <Send className="w-4 h-4" />
-          </button>
+          {isProcessing && onCancelRequest ? (
+            <button
+              type="button"
+              onClick={onCancelRequest}
+              className="btn-danger px-6 flex items-center gap-2"
+              title="Stop current request"
+            >
+              <StopCircle className="w-4 h-4" />
+              <span className="hidden sm:inline">Stop</span>
+            </button>
+          ) : (
+            <button
+              type="submit"
+              disabled={!connected || !input.trim() || isProcessing}
+              className={clsx(
+                'btn-primary px-6 flex items-center gap-2',
+                (!connected || !input.trim() || isProcessing) && 'opacity-50 cursor-not-allowed'
+              )}
+            >
+              <Send className="w-4 h-4" />
+            </button>
+          )}
         </div>
       </form>
     </div>

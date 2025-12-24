@@ -18,13 +18,18 @@ from .agents import BrowserAgent, FileAgent
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
     # Startup
+    import time
+    start_time = time.time()
     print("🚀 Starting Ambient Desktop Agent...")
     
-    # Initialize database
-    await init_db()
-    print("✅ Database initialized")
+    # Initialize database (non-blocking)
+    try:
+        await init_db()
+        print("✅ Database initialized")
+    except Exception as e:
+        print(f"⚠️  Database initialization skipped: {e}")
     
-    # Register task handlers with scheduler
+    # Register task handlers with scheduler (lazy - agents created on demand)
     async def handle_browser_task(task):
         agent = BrowserAgent()
         await agent.start()
@@ -48,7 +53,8 @@ async def lifespan(app: FastAPI):
     await scheduler.start()
     print("✅ Task scheduler started")
     
-    print("✅ LangGraph agent workflow ready")
+    elapsed = time.time() - start_time
+    print(f"✅ LangGraph agent workflow ready (startup took {elapsed:.2f}s)")
     
     print("🟢 Ambient Desktop Agent is ready!")
     print(f"   API: http://localhost:{settings.port}")

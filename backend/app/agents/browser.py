@@ -27,13 +27,14 @@ class BrowserAgent(BaseAgent):
     def __init__(
         self,
         name: Optional[str] = None,
-        headless: bool = True,
+        headless: Optional[bool] = None,
         cdp_url: Optional[str] = None,  # e.g., "http://localhost:9222"
         user_data_dir: Optional[str] = None,  # For persistent sessions
     ):
         super().__init__(name)
-        self.headless = headless
-        self.cdp_url = cdp_url
+        # Use settings as defaults
+        self.headless = headless if headless is not None else settings.browser_headless
+        self.cdp_url = cdp_url if cdp_url is not None else settings.browser_cdp_url
         self.user_data_dir = user_data_dir
         self._playwright = None
         self._browser: Optional[Browser] = None
@@ -238,49 +239,91 @@ class BrowserAgent(BaseAgent):
             }
 
     async def _action_click(self, payload: dict) -> dict[str, Any]:
-        """Click on an element."""
+        """Click on an element.
+        
+        Args:
+            text: Text to find and click (e.g., "Show all 83 patents")
+            section: Optional section to scope the search (e.g., "Patents")
+            selector: CSS selector (use text instead when possible)
+            exact: If True, match text exactly; if False, partial match (default: True for specific texts)
+        """
         selector = payload.get("selector")
         text = payload.get("text")
-        timeout = payload.get("timeout", 15000)  # 15 second default for dynamic sites
+        section = payload.get("section")  # Scope click to a section
+        timeout = payload.get("timeout", 15000)
         
-        await self.update_status(AgentStatus.BUSY, summary=f"Clicking: {selector or text}")
+        await self.update_status(AgentStatus.BUSY, summary=f"Clicking: {text or selector}")
+        
+        # Remember current URL to detect navigation
+        original_url = self._page.url
         
         try:
             if text:
-                locator = self._page.get_by_text(text, exact=False)
-                # Check if element exists
-                if await locator.count() == 0:
+                # Use exact match for specific texts like "Show all 83 patents"
+                # Use partial match for generic texts like "Show all"
+                use_exact = len(text) > 15 or any(c.isdigit() for c in text)
+                
+                if section:
+                    # Try to find the section first, then look for the text within it
+                    section_locator = self._page.get_by_text(section, exact=False).first
+                    # Look for the text near the section (within same parent/ancestor)
+                    locator = self._page.locator(f"text=/{text}/i").filter(
+                        has=self._page.locator(f":scope:near(:text('{section}'))")
+                    )
+                    if await locator.count() == 0:
+                        # Fallback: just find by text
+                        locator = self._page.get_by_text(text, exact=use_exact)
+                else:
+                    locator = self._page.get_by_text(text, exact=use_exact)
+                
+                count = await locator.count()
+                if count == 0:
+                    # Try partial match as fallback
+                    locator = self._page.get_by_text(text, exact=False)
+                    count = await locator.count()
+                
+                if count == 0:
                     return {
                         "error": f"No element found with text: {text}",
                         "url": self._page.url,
-                        "suggestion": "Try a different text or use a CSS selector",
+                        "suggestion": "Try the exact text as it appears on the page",
                     }
+                
+                if count > 1:
+                    await self.log("warning", f"Found {count} elements matching '{text}', clicking first one")
+                
+                # Click the first matching element
                 await locator.first.click(timeout=timeout)
+                
             elif selector:
                 locator = self._page.locator(selector)
-                # Check if element exists
                 if await locator.count() == 0:
                     return {
                         "error": f"No element found matching: {selector}",
                         "url": self._page.url,
-                        "suggestion": "Check the selector or try text-based clicking",
                     }
                 await locator.first.click(timeout=timeout)
             else:
                 return {"error": "Selector or text required for click action"}
             
-            # Wait a moment for page to react
+            # Wait for page to react
             await asyncio.sleep(0.5)
             
+            # Check if we navigated away (which might be unintended)
+            new_url = self._page.url
+            navigated = new_url != original_url
+            
             return {
-                "clicked": selector or text,
-                "url": self._page.url,
+                "clicked": text or selector,
+                "url": new_url,
                 "title": await self._page.title(),
+                "navigated": navigated,
+                "previous_url": original_url if navigated else None,
             }
         except Exception as e:
             return {
                 "error": f"Click failed: {str(e)}",
-                "target": selector or text,
+                "target": text or selector,
                 "url": self._page.url,
             }
 
@@ -324,22 +367,27 @@ class BrowserAgent(BaseAgent):
         }
 
     async def _action_extract(self, payload: dict) -> dict[str, Any]:
-        """Extract text or data from the page."""
+        """Extract text or data from the page.
+        
+        By default, extracts visible content WITHOUT scrolling or clicking,
+        to avoid accidentally navigating away from the current page.
+        Set full_page=True to enable scrolling for lazy-loaded content.
+        """
         selector = payload.get("selector")
         attribute = payload.get("attribute")
         all_matches = payload.get("all", False)
         timeout = payload.get("timeout", 15000)  # 15 second default for dynamic sites
-        full_page = payload.get("full_page", True)  # Auto-scroll and expand by default
+        full_page = payload.get("full_page", False)  # Disabled by default - safer
         
         await self.update_status(AgentStatus.BUSY, summary=f"Extracting from: {selector or 'page'}")
         
-        # Wait for network to settle and page to be ready
+        # Wait briefly for page to be ready (short timeout to not delay)
         try:
-            await self._page.wait_for_load_state("networkidle", timeout=5000)
+            await self._page.wait_for_load_state("domcontentloaded", timeout=3000)
         except Exception:
-            pass  # Continue even if network doesn't settle
+            pass  # Continue even if not fully loaded
         
-        # Auto-scroll and expand for full page extraction
+        # Only scroll if explicitly requested - safer default
         if full_page and not selector:
             await self._load_full_page()
         
@@ -399,60 +447,85 @@ class BrowserAgent(BaseAgent):
             }
 
     async def _load_full_page(self) -> None:
-        """Scroll through page and click 'show more' buttons to load all content."""
+        """Scroll through page to trigger lazy loading and click 'show more' buttons."""
         import asyncio
-        
-        # Common "show more" button patterns (generic, not site-specific)
-        more_button_patterns = [
-            "text=/show\\s*(all|more)/i",
-            "text=/load\\s*more/i",
-            "text=/see\\s*(all|more)/i",
-            "text=/view\\s*(all|more)/i",
-            "text=/expand/i",
-            "[aria-label*='more' i]",
-            "[aria-label*='expand' i]",
-            "button:has-text('more')",
-            "a:has-text('more')",
-        ]
         
         await self.update_status(AgentStatus.BUSY, summary="Loading full page content...")
         
+        # Remember the current URL to detect unwanted navigation
+        original_url = self._page.url
+        original_domain = original_url.split('/')[2] if '/' in original_url else original_url
+        
+        # Click "Show more" / "Load more" buttons until none remain
+        show_more_clicks = 0
+        max_show_more = 20  # Safety limit
+        
+        while show_more_clicks < max_show_more:
+            try:
+                # Look for common "show more" patterns (case insensitive)
+                btn = await self._page.query_selector(
+                    'button:has-text("Show more"), button:has-text("Load more"), '
+                    'button:has-text("See more"), a:has-text("Show all")'
+                )
+                if btn:
+                    visible = await btn.is_visible()
+                    if visible:
+                        await btn.scroll_into_view_if_needed()
+                        await asyncio.sleep(0.3)
+                        await btn.click()
+                        show_more_clicks += 1
+                        print(f"[BROWSER] Clicked show more #{show_more_clicks}")
+                        await asyncio.sleep(1.5)  # Wait for content to load
+                        
+                        # Check for navigation
+                        current_domain = self._page.url.split('/')[2] if '/' in self._page.url else self._page.url
+                        if current_domain != original_domain:
+                            print(f"[BROWSER] Navigation detected, going back")
+                            await self._page.go_back()
+                            await asyncio.sleep(1)
+                            break
+                        continue
+                break  # No more buttons found
+            except Exception as e:
+                print(f"[BROWSER] Show more click error: {e}")
+                break
+        
         # Scroll to bottom progressively to trigger lazy loading
         prev_height = 0
+        stable_count = 0
         scroll_attempts = 0
-        max_scrolls = 20  # Limit scrolling to prevent infinite loops
+        max_scrolls = 100  # Allow more scrolling for long pages
         
         while scroll_attempts < max_scrolls:
             # Get current scroll height
             current_height = await self._page.evaluate("document.body.scrollHeight")
             
             if current_height == prev_height:
-                break  # No more content to load
+                stable_count += 1
+                if stable_count >= 3:  # Height stable for 3 iterations
+                    break
+            else:
+                stable_count = 0
             
             prev_height = current_height
             
             # Scroll down
-            await self._page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await asyncio.sleep(0.5)  # Wait for lazy content to load
+            await self._page.evaluate("window.scrollBy(0, 1500)")
+            await asyncio.sleep(0.4)  # Longer wait for lazy content
             
-            # Try to click any "show more" buttons that appeared
-            for pattern in more_button_patterns:
-                try:
-                    locator = self._page.locator(pattern)
-                    if await locator.count() > 0:
-                        # Click all visible "more" buttons
-                        for i in range(min(await locator.count(), 5)):  # Max 5 clicks per pattern
-                            try:
-                                btn = locator.nth(i)
-                                if await btn.is_visible():
-                                    await btn.click(timeout=2000)
-                                    await asyncio.sleep(0.3)
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+            # Check if URL changed (navigation happened unexpectedly)
+            current_domain = self._page.url.split('/')[2] if '/' in self._page.url else self._page.url
+            if current_domain != original_domain:
+                print(f"[BROWSER] Warning: Domain changed during scroll, navigating back")
+                await self._page.go_back()
+                await asyncio.sleep(0.5)
+                break
             
             scroll_attempts += 1
+            
+            # Log progress every 20 scrolls
+            if scroll_attempts % 20 == 0:
+                print(f"[BROWSER] Scrolled {scroll_attempts} times, height={current_height}")
         
         # Scroll back to top
         await self._page.evaluate("window.scrollTo(0, 0)")
@@ -463,6 +536,8 @@ class BrowserAgent(BaseAgent):
             await self._page.wait_for_load_state("networkidle", timeout=3000)
         except Exception:
             pass
+        
+        print(f"[BROWSER] Full page load complete: {show_more_clicks} show-more clicks, {scroll_attempts} scrolls")
 
     async def _action_wait(self, payload: dict) -> dict[str, Any]:
         """Wait for an element or time."""
@@ -883,9 +958,9 @@ class BrowserAgent(BaseAgent):
         """Navigate to a URL."""
         return await self._action_navigate({"url": url})
 
-    async def click(self, selector: str = None, text: str = None) -> dict[str, Any]:
-        """Click on an element."""
-        return await self._action_click({"selector": selector, "text": text})
+    async def click(self, selector: str = None, text: str = None, section: str = None) -> dict[str, Any]:
+        """Click on an element, optionally scoped to a section."""
+        return await self._action_click({"selector": selector, "text": text, "section": section})
 
     async def type_text(self, selector: str, text: str, clear: bool = True) -> dict[str, Any]:
         """Type text into an element."""

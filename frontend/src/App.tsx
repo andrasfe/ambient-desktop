@@ -9,7 +9,7 @@ import { Header } from './components/Header';
 import { StatusBar } from './components/StatusBar';
 
 function App() {
-  const { sendMessage } = useWebSocket();
+  const { sendMessage, cancelRequest } = useWebSocket();
   const connected = useAgentStore((state) => state.connected);
   const sessions = useAgentStore((state) => state.sessions);
   const activeSessionId = useAgentStore((state) => state.activeSessionId);
@@ -36,7 +36,7 @@ function App() {
 
         {/* Center Panel - Chat */}
         <div className="flex-1 flex flex-col border-r border-void-800 min-w-0">
-          <Chat onSendMessage={sendMessage} />
+          <Chat onSendMessage={sendMessage} onCancelRequest={cancelRequest} />
         </div>
 
         {/* Right Panel - Logs & Agents */}

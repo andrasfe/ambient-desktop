@@ -1,4 +1,4 @@
-"""OpenRouter LLM service with streaming support."""
+"""LLM service with streaming support for OpenRouter, Ollama, LMStudio, and OpenAI-compatible APIs."""
 
 import json
 from typing import AsyncGenerator, Optional
@@ -26,7 +26,7 @@ class LLMResponse:
 
 
 class LLMService:
-    """OpenRouter LLM integration with streaming support."""
+    """LLM integration with streaming support for OpenRouter, Ollama, LMStudio, and OpenAI-compatible APIs."""
 
     def __init__(
         self,
@@ -38,18 +38,25 @@ class LLMService:
         self.model = model or settings.openrouter_model
         self.base_url = base_url or settings.openrouter_base_url
         self._client: Optional[httpx.AsyncClient] = None
+        self._is_local = settings.is_local_llm
+        self._requires_api_key = settings.requires_api_key
 
     async def _get_client(self) -> httpx.AsyncClient:
         """Get or create HTTP client."""
         if self._client is None:
+            headers = {
+                "Content-Type": "application/json",
+            }
+            
+            # Only add auth header if API key is required (cloud providers)
+            if self._requires_api_key and self.api_key:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+                headers["HTTP-Referer"] = "https://ambient-desktop.local"
+                headers["X-Title"] = "Ambient Desktop Agent"
+            
             self._client = httpx.AsyncClient(
                 base_url=self.base_url,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                    "HTTP-Referer": "https://ambient-desktop.local",
-                    "X-Title": "Ambient Desktop Agent",
-                },
+                headers=headers,
                 timeout=120.0,
             )
         return self._client

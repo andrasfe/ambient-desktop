@@ -15,36 +15,49 @@ class Settings(BaseSettings):
         description="PostgreSQL connection string",
     )
 
-    # LLM Configuration (supports OpenRouter, Ollama, or any OpenAI-compatible API)
-    openrouter_api_key: str = Field(default="", description="API key (use 'ollama' for local)")
+    # LLM Configuration (supports OpenRouter, Ollama, LMStudio, or any OpenAI-compatible API)
+    openrouter_api_key: str = Field(default="", description="API key (use 'ollama' or 'lmstudio' for local)")
     openrouter_base_url: str = Field(
         default="https://openrouter.ai/api/v1",
-        description="API base URL (e.g., http://localhost:11434/v1 for Ollama)",
+        description="API base URL (e.g., http://localhost:11434/v1 for Ollama, http://localhost:1234/v1 for LMStudio)",
     )
     openrouter_model: str = Field(
         default="anthropic/claude-3.5-sonnet",
-        description="Model to use (e.g., llama3.1:8b for Ollama)",
+        description="Model to use (e.g., llama3.1:8b for Ollama, or model loaded in LMStudio)",
     )
     
     # Privacy settings
     privacy_mode: bool = Field(
         default=False,
-        description="When true, minimizes data sent to LLM (only sends task descriptions)",
+        description="When true, minimizes data sent to LLM (only sends task descriptions). Auto-enabled for local LLMs.",
     )
     local_llm: bool = Field(
         default=False,
-        description="Auto-detected: true when using Ollama or local endpoint",
+        description="Auto-detected: true when using Ollama, LMStudio, or local endpoint",
     )
     
     @property
     def is_local_llm(self) -> bool:
-        """Check if we're using a local LLM."""
+        """Check if we're using a local LLM (Ollama, LMStudio, or other local endpoint)."""
         return (
-            self.openrouter_api_key.lower() == "ollama" or
+            self.openrouter_api_key.lower() in ("ollama", "lmstudio", "") or
             "localhost" in self.openrouter_base_url or
             "127.0.0.1" in self.openrouter_base_url or
             self.local_llm
         )
+    
+    @property
+    def is_lmstudio(self) -> bool:
+        """Check if we're using LMStudio."""
+        return (
+            self.openrouter_api_key.lower() == "lmstudio" or
+            ":1234" in self.openrouter_base_url
+        )
+    
+    @property
+    def requires_api_key(self) -> bool:
+        """Check if the current LLM configuration requires an API key."""
+        return not self.is_local_llm
 
     # Cohere Embeddings
     cohere_api_key: str = Field(default="", description="Cohere API key")

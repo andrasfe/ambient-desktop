@@ -1,6 +1,19 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+// UUID fallback for browsers that don't support crypto.randomUUID
+function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) {
+    return crypto.randomUUID();
+  }
+  // Fallback for older browsers
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
 export interface Message {
   id: string;
   role: 'user' | 'assistant' | 'system';
@@ -57,6 +70,10 @@ interface AgentStore {
   clientId: string | null;
   setConnected: (connected: boolean, clientId?: string) => void;
 
+  // Processing state
+  isProcessing: boolean;
+  setProcessing: (processing: boolean) => void;
+
   // Sessions
   sessions: ChatSession[];
   activeSessionId: string | null;
@@ -93,7 +110,7 @@ interface AgentStore {
 
 // Helper to create a new session
 const createNewSession = (name?: string): ChatSession => ({
-  id: crypto.randomUUID(),
+  id: generateUUID(),
   name: name || `Chat ${new Date().toLocaleDateString()}`,
   messages: [],
   createdAt: new Date(),
@@ -107,6 +124,10 @@ export const useAgentStore = create<AgentStore>()(
       connected: false,
       clientId: null,
       setConnected: (connected, clientId) => set({ connected, clientId: clientId || null }),
+
+      // Processing state
+      isProcessing: false,
+      setProcessing: (processing) => set({ isProcessing: processing }),
 
       // Sessions
       sessions: [],
@@ -190,38 +211,51 @@ export const useAgentStore = create<AgentStore>()(
       messages: [],
       streamingContent: '',
       addMessage: (message) => set((state) => {
-        const newMessage = {
-          ...message,
-          id: crypto.randomUUID(),
-          timestamp: new Date(),
-        };
-        const newMessages = [...state.messages, newMessage];
-        
-        // If no active session, create one
-        if (!state.activeSessionId || !state.sessions.find((s) => s.id === state.activeSessionId)) {
-          const newSession = {
-            id: crypto.randomUUID(),
-            name: `Chat ${new Date().toLocaleDateString()}`,
-            messages: newMessages,
-            createdAt: new Date(),
-            updatedAt: new Date(),
+        try {
+          // Sanitize content - limit length to prevent localStorage issues
+          const MAX_MESSAGE_LENGTH = 50000;
+          const sanitizedContent = typeof message.content === 'string' 
+            ? message.content.slice(0, MAX_MESSAGE_LENGTH)
+            : String(message.content || '');
+          
+          const newMessage = {
+            ...message,
+            content: sanitizedContent,
+            id: generateUUID(),
+            timestamp: new Date(),
           };
+          const newMessages = [...state.messages, newMessage];
+          
+          // If no active session, create one
+          if (!state.activeSessionId || !state.sessions.find((s) => s.id === state.activeSessionId)) {
+            const newSession = {
+              id: generateUUID(),
+              name: `Chat ${new Date().toLocaleDateString()}`,
+              messages: newMessages,
+              createdAt: new Date(),
+              updatedAt: new Date(),
+            };
+            return {
+              messages: newMessages,
+              sessions: [newSession, ...state.sessions],
+              activeSessionId: newSession.id,
+            };
+          }
+          
+          // Update the active session
           return {
             messages: newMessages,
-            sessions: [newSession, ...state.sessions],
-            activeSessionId: newSession.id,
+            sessions: state.sessions.map((s) =>
+              s.id === state.activeSessionId
+                ? { ...s, messages: newMessages, updatedAt: new Date() }
+                : s
+            ),
           };
+        } catch (e) {
+          console.error('Error adding message:', e);
+          // Return unchanged state on error
+          return state;
         }
-        
-        // Update the active session
-        return {
-          messages: newMessages,
-          sessions: state.sessions.map((s) =>
-            s.id === state.activeSessionId
-              ? { ...s, messages: newMessages, updatedAt: new Date() }
-              : s
-          ),
-        };
       }),
       updateStreamingContent: (content) => set((state) => ({
         streamingContent: state.streamingContent + content,
@@ -254,12 +288,11 @@ export const useAgentStore = create<AgentStore>()(
             agents: [
               ...state.agents,
               {
-                id: agent.id,
                 type: agent.type || 'custom',
                 name: agent.name || 'Unknown Agent',
                 status: agent.status || 'idle',
                 metadata: agent.metadata || {},
-                ...agent,
+                ...agent,  // id comes from agent
               } as Agent,
             ],
           };
@@ -275,7 +308,7 @@ export const useAgentStore = create<AgentStore>()(
         logs: [
           {
             ...log,
-            id: crypto.randomUUID(),
+            id: generateUUID(),
             timestamp: new Date(),
           },
           ...state.logs,
@@ -294,51 +327,101 @@ export const useAgentStore = create<AgentStore>()(
     }),
     {
       name: 'ambient-agent-storage',
+      // Custom storage that handles errors gracefully
+      storage: {
+        getItem: (name) => {
+          try {
+            const value = localStorage.getItem(name);
+            return value ? JSON.parse(value) : null;
+          } catch (e) {
+            console.error('Error reading from localStorage:', e);
+            return null;
+          }
+        },
+        setItem: (name, value) => {
+          try {
+            localStorage.setItem(name, JSON.stringify(value));
+          } catch (e) {
+            console.error('Error writing to localStorage:', e);
+            // If storage is full, try to clear old data
+            if (e instanceof DOMException && e.name === 'QuotaExceededError') {
+              try {
+                localStorage.removeItem(name);
+                console.warn('Cleared localStorage due to quota exceeded');
+              } catch {
+                // Ignore
+              }
+            }
+          }
+        },
+        removeItem: (name) => {
+          try {
+            localStorage.removeItem(name);
+          } catch (e) {
+            console.error('Error removing from localStorage:', e);
+          }
+        },
+      },
       // Persist sessions and logs
       partialize: (state) => ({
-        sessions: state.sessions,
+        sessions: state.sessions.slice(0, 10), // Keep only last 10 sessions
         activeSessionId: state.activeSessionId,
-        messages: state.messages,
+        messages: state.messages.slice(-100), // Keep only last 100 messages
         logs: state.logs.slice(0, 100),
       }),
       // Deserialize dates back to Date objects
       onRehydrateStorage: () => (state) => {
         if (state) {
-          state.sessions = state.sessions.map((session) => ({
-            ...session,
-            createdAt: new Date(session.createdAt),
-            updatedAt: new Date(session.updatedAt),
-            messages: session.messages.map((msg) => ({
+          try {
+            state.sessions = (state.sessions || []).map((session) => ({
+              ...session,
+              createdAt: new Date(session.createdAt),
+              updatedAt: new Date(session.updatedAt),
+              messages: (session.messages || []).map((msg) => ({
+                ...msg,
+                timestamp: new Date(msg.timestamp),
+              })),
+            }));
+            state.messages = (state.messages || []).map((msg) => ({
               ...msg,
               timestamp: new Date(msg.timestamp),
-            })),
-          }));
-          state.messages = state.messages.map((msg) => ({
-            ...msg,
-            timestamp: new Date(msg.timestamp),
-          }));
-          state.logs = state.logs.map((log) => ({
-            ...log,
-            timestamp: new Date(log.timestamp),
-          }));
-          
-          // Ensure there's always an active session
-          if (!state.activeSessionId || !state.sessions.find(s => s.id === state.activeSessionId)) {
-            if (state.sessions.length > 0) {
-              state.activeSessionId = state.sessions[0].id;
-              state.messages = state.sessions[0].messages;
-            } else {
-              // No sessions at all, create a default one
-              const newSession = {
-                id: crypto.randomUUID(),
-                name: `Chat ${new Date().toLocaleDateString()}`,
-                messages: [],
-                createdAt: new Date(),
-                updatedAt: new Date(),
-              };
-              state.sessions = [newSession];
-              state.activeSessionId = newSession.id;
-              state.messages = [];
+            }));
+            state.logs = (state.logs || []).map((log) => ({
+              ...log,
+              timestamp: new Date(log.timestamp),
+            }));
+            
+            // Ensure there's always an active session
+            if (!state.activeSessionId || !state.sessions.find(s => s.id === state.activeSessionId)) {
+              if (state.sessions.length > 0) {
+                state.activeSessionId = state.sessions[0].id;
+                state.messages = state.sessions[0].messages;
+              } else {
+                // No sessions at all, create a default one
+                const newSession = {
+                  id: generateUUID(),
+                  name: `Chat ${new Date().toLocaleDateString()}`,
+                  messages: [],
+                  createdAt: new Date(),
+                  updatedAt: new Date(),
+                };
+                state.sessions = [newSession];
+                state.activeSessionId = newSession.id;
+                state.messages = [];
+              }
+            }
+          } catch (e) {
+            console.error('Failed to rehydrate state, resetting to defaults:', e);
+            // Don't reload - just reset to safe defaults
+            state.sessions = [];
+            state.activeSessionId = null;
+            state.messages = [];
+            state.logs = [];
+            // Clear corrupted storage
+            try {
+              localStorage.removeItem('ambient-agent-storage');
+            } catch (storageErr) {
+              console.error('Failed to clear storage:', storageErr);
             }
           }
         }

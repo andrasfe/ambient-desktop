@@ -12,13 +12,19 @@ from sqlalchemy.ext.asyncio import (
 from .config import settings
 from .models import Base
 
-# Create async engine
+# Create async engine with optimized settings for faster startup
 engine = create_async_engine(
     settings.database_url,
     echo=settings.debug,
     pool_pre_ping=True,
     pool_size=5,
     max_overflow=10,
+    connect_args={
+        "server_settings": {
+            "application_name": "ambient_desktop",
+        },
+        "command_timeout": 5,  # Fail fast if DB is unreachable
+    },
 )
 
 # Session factory
@@ -33,8 +39,13 @@ async_session_maker = async_sessionmaker(
 
 async def init_db() -> None:
     """Initialize database tables."""
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+    except Exception as e:
+        # Log but don't fail startup if DB is temporarily unavailable
+        print(f"⚠️  Database initialization warning: {e}")
+        print("   The server will start, but database features may be limited.")
 
 
 async def close_db() -> None:

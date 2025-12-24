@@ -62,8 +62,15 @@ export function ActivityLog() {
         ) : (
           <div className="divide-y divide-void-900">
             {logs.map((log) => {
-              const Icon = levelIcons[log.level];
-              const colorClass = levelColors[log.level];
+              // Safe lookup with fallback to Info icon
+              const level = log.level && levelIcons[log.level] ? log.level : 'info';
+              const Icon = levelIcons[level] || Info;
+              const colorClass = levelColors[level] || 'text-void-500';
+              
+              // Safe timestamp handling
+              const timestamp = log.timestamp instanceof Date 
+                ? log.timestamp 
+                : new Date(log.timestamp || Date.now());
 
               return (
                 <div
@@ -78,10 +85,10 @@ export function ActivityLog() {
                     <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-2">
                         <span className={clsx('font-medium', colorClass)}>
-                          [{log.category}]
+                          [{log.category || 'general'}]
                         </span>
                         <span className="text-void-400 truncate">
-                          {log.message}
+                          {log.message || ''}
                         </span>
                       </div>
                       {log.details && (
@@ -91,7 +98,7 @@ export function ActivityLog() {
                       )}
                     </div>
                     <span className="text-[10px] text-void-600 shrink-0">
-                      {log.timestamp.toLocaleTimeString()}
+                      {timestamp.toLocaleTimeString()}
                     </span>
                   </div>
                 </div>

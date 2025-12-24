@@ -76,6 +76,19 @@ body {
     box-shadow: 0 0 20px rgba(0, 255, 255, 0.3);
   }
 
+  .btn-danger {
+    @apply px-4 py-2 rounded-lg font-medium transition-all duration-200;
+    background: linear-gradient(135deg, rgba(255, 60, 60, 0.3) 0%, rgba(255, 0, 100, 0.2) 100%);
+    border: 1px solid rgba(255, 60, 60, 0.5);
+    color: #ff6b6b;
+  }
+
+  .btn-danger:hover {
+    background: linear-gradient(135deg, rgba(255, 60, 60, 0.5) 0%, rgba(255, 0, 100, 0.3) 100%);
+    box-shadow: 0 0 20px rgba(255, 60, 60, 0.4);
+    color: #fff;
+  }
+
   .input-field {
     @apply w-full px-4 py-3 rounded-lg font-mono text-sm transition-all duration-200;
     background: rgba(10, 10, 26, 0.8);

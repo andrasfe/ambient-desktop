@@ -10,6 +10,9 @@ if [ -f /tmp/ambient-backend.pid ]; then
 fi
 pkill -f "python run.py" 2>/dev/null || true
 
+# Also kill anything on port 8000
+lsof -ti :8000 | xargs kill -9 2>/dev/null || true
+
 # Kill frontend
 if [ -f /tmp/ambient-frontend.pid ]; then
     kill $(cat /tmp/ambient-frontend.pid) 2>/dev/null

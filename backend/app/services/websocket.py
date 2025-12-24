@@ -18,6 +18,7 @@ class EventType(str, Enum):
     CHAT_MESSAGE = "chat:message"
     CHAT_STREAM = "chat:stream"
     CHAT_STREAM_END = "chat:stream_end"
+    CHAT_CANCELLED = "chat:cancelled"
     
     # Agent events
     AGENT_CREATED = "agent:created"
@@ -87,13 +88,19 @@ class WebSocketManager:
             websocket = self._connections.get(client_id)
         
         if not websocket:
+            print(f"[WS-MGR] ❌ No websocket found for client: {client_id}")
+            print(f"[WS-MGR] Active clients: {list(self._connections.keys())}")
             return False
         
         try:
             event = WebSocketEvent(type=event_type, data=data)
-            await websocket.send_text(event.to_json())
+            json_msg = event.to_json()
+            print(f"[WS-MGR] Sending to {client_id}: {event_type.value} ({len(json_msg)} bytes)")
+            await websocket.send_text(json_msg)
+            print(f"[WS-MGR] ✅ Sent successfully")
             return True
-        except Exception:
+        except Exception as e:
+            print(f"[WS-MGR] ❌ Send failed: {e}")
             await self.disconnect(client_id)
             return False
 

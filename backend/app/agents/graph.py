@@ -37,6 +37,11 @@ class AgentState(TypedDict):
     # Browser state persistence
     selected_tab_index: Optional[int]  # Persist tab selection across subtasks
     
+    # Retry tracking for finding complete data
+    retry_count: int  # Number of retry attempts
+    max_retries: int  # Maximum retries (default 50)
+    tried_approaches: list[str]  # Track what we've already tried
+    
     # Agent metadata
     agent_id: str
     session_id: str
@@ -95,72 +100,42 @@ def sanitize_for_llm(data: dict) -> dict:
 # System prompts
 COORDINATOR_SYSTEM_PROMPT = """You are an AI coordinator that orchestrates computer automation tasks.
 
-CRITICAL RULE: Check the CURRENT BROWSER STATE section below before planning any actions.
-If the page you need is ALREADY OPEN, just extract - DO NOT navigate or click unnecessarily!
+CRITICAL RULES:
+1. EXTRACT FIRST: Always start by extracting the current page content
+2. The system will automatically detect incomplete data and expand sections as needed
+3. NEVER use "list_tabs" unless user explicitly asks to list tabs
+4. NEVER use "navigate" unless user gives a specific URL to visit
 
 BROWSER agent actions:
-- "extract" - Extract text from current page. params: {} (empty = get all visible text)
-- "switch_tab" - Switch to a tab. params: {"url_contains": "linkedin.com"} or {"index": 0}
-- "scroll" - Scroll page. params: {"direction": "down"} or {"section": "Patents"}
-- "click" - Click an element. params: {"text": "button text"} (prefer text over selectors)
-- "navigate" - Go to a URL. params: {"url": "https://..."}
+- "extract" - Extract text from current page. params: {} (DEFAULT - use this first!)
+- "scroll" - Scroll the page. params: {"direction": "down"} or {"section": "SectionName"}
+- "click" - Click an element. params: {"text": "EXACT TEXT FROM PAGE"}
+- "switch_tab" - Switch to a tab. params: {"url_contains": "domain.com"}
+- "navigate" - Go to a URL. params: {"url": "https://..."} (ONLY if user provides URL)
 - "type" - Type into input. params: {"selector": "input", "text": "text"}
-- "edit_fields" - Generic edit in a form: find item by text and set/swap fields by semantic-ish field name matching.
-  params: {"match_text": "...", "swap": ["Field A", "Field B"]} or {"match_text": "...", "fields": {"Field": "New value"}}
 - "screenshot" - Take screenshot. params: {}
-- "list_tabs" - List open tabs. params: {}
 
-FILE agent actions:
-- "read" - Read file. params: {"path": "/path/to/file"}
-- "write" - Write file. params: {"path": "/path/to/file", "content": "..."}
-- "list" - List directory. params: {"path": "/path/to/dir"}
-
-DECISION FLOW:
-1. READ the "CURRENT BROWSER STATE" section - especially "Active URL" and "All open tabs"
-2. CHECK if the content user wants is on a DIFFERENT tab than the Active tab
-3. If content is on a different tab → MUST use "switch_tab" FIRST
-4. Then use "extract" to get the content
-
-CRITICAL TAB SWITCHING:
-- Look at "Active URL" - this is where actions will happen
-- Look at "All open tabs" - user might want content from a different tab
-- If user asks for "linkedin" content but Active URL is NOT linkedin → switch_tab first!
-- Example: Active=openrouter.ai, user wants LinkedIn → [switch_tab, extract]
-
-EXAMPLES:
-User: "extract from linkedin" (Active URL: openrouter.ai, Tab 3 is linkedin)
-→ [{"agent": "browser", "action": "switch_tab", "params": {"url_contains": "linkedin"}},
-   {"agent": "browser", "action": "extract", "params": {}}]
-
-User: "get text from current page" (any active URL)
-→ [{"agent": "browser", "action": "extract", "params": {}}]
+APPROACH:
+1. Use "extract" to get page content
+2. System automatically handles expanding sections if data is incomplete
+3. Analyze and answer the user's question
 
 Respond with a JSON object:
 {
-    "understanding": "Brief summary of what user wants",
-    "subtasks": [
-        {
-            "agent": "browser|file",
-            "action": "action name",
-            "params": { ... }
-        }
-    ],
+    "understanding": "Brief summary",
+    "subtasks": [{"agent": "browser", "action": "extract", "params": {}}],
     "response": "What to tell the user"
 }
 
 EXAMPLES:
 
-User: "extract patents from linkedin" (and LinkedIn profile is already the active tab)
-→ {"subtasks": [{"agent": "browser", "action": "extract", "params": {}}]}
-
-User: "get info from linkedin" (but active tab is CNN)
-→ {"subtasks": [{"agent": "browser", "action": "switch_tab", "params": {"url_contains": "linkedin"}}, {"agent": "browser", "action": "extract", "params": {}}]}
+User: "what stocks are in this portfolio?" → extract first, system expands if needed
+User: "list all the items on this page" → extract first
+User: "show me the content" → extract
 
 IMPORTANT: 
-- Use ONLY the action names listed above
-- Check current browser state BEFORE planning navigation
-- Prefer minimal actions - if content is already visible, just extract!
-- It's OK (and expected) for subagents to perform MULTIPLE steps in sequence (one step at a time) to complete a request.
+- Always start with "extract" - keep it simple
+- System automatically detects and expands incomplete sections (e.g., "Show all", "Load more")
 - NEVER output raw tool-call markup"""
 
 # Some OpenRouter models sometimes emit raw "tool call" markup (e.g. <|tool_call_begin|>).
@@ -434,6 +409,26 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
             parsed = json.loads(content.strip())
             subtasks = parsed.get("subtasks", [])
             print(f"[COORDINATOR] Found {len(subtasks)} subtasks")
+            
+            # Post-process: Remove redundant switch_tab if the target page is already active
+            if subtasks and browser_context:
+                active_url_match = re.search(r"Active URL:\s*(\S+)", browser_context)
+                active_url = active_url_match.group(1) if active_url_match else ""
+                
+                filtered_subtasks = []
+                for st in subtasks:
+                    if st.get("action") == "switch_tab":
+                        url_contains = st.get("params", {}).get("url_contains", "")
+                        # Skip switch_tab if active URL already matches
+                        if url_contains and url_contains.lower() in active_url.lower():
+                            print(f"[COORDINATOR] Skipping redundant switch_tab ('{url_contains}' already in active URL '{active_url}')")
+                            continue
+                    filtered_subtasks.append(st)
+                
+                if len(filtered_subtasks) != len(subtasks):
+                    print(f"[COORDINATOR] Filtered subtasks: {len(subtasks)} -> {len(filtered_subtasks)}")
+                    subtasks = filtered_subtasks
+            
             response_text = parsed.get("response", content)
             
             await ws_manager.broadcast_log(
@@ -557,10 +552,17 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
             },
         )
         raise
+    finally:
+        # Always clean up the coordinator agent from UI
+        await ws_manager.broadcast(
+            EventType.AGENT_REMOVED,
+            {"id": coordinator_id},
+        )
 
 
 async def browser_node(state: AgentState) -> dict:
     """Browser agent node - executes browser automation tasks."""
+    import asyncio
     from .browser import BrowserAgent
     
     subtasks = state.get("subtasks", [])
@@ -621,14 +623,55 @@ async def browser_node(state: AgentState) -> dict:
             # find_element is treated as click since it's usually followed by interaction
             selector = params.get("selector")
             text = params.get("text", params.get("description", ""))
-            result = await agent.click(selector=selector, text=text if not selector else None)
+            section = params.get("section")
+            
+            # Remember the URL before clicking to detect accidental navigation
+            url_before_click = agent.page.url if agent.page else None
+            
+            result = await agent.click(selector=selector, text=text if not selector else None, section=section)
+            
+            # Check if we accidentally navigated away
+            if result.get("navigated") and url_before_click:
+                new_url = result.get("url", "")
+                # If we navigated to a completely different domain or a different page type, go back
+                from urllib.parse import urlparse
+                old_domain = urlparse(url_before_click).netloc
+                new_domain = urlparse(new_url).netloc
+                
+                # Detect accidental navigation (different domain, or went to a list/search page)
+                is_accidental = (
+                    old_domain != new_domain or
+                    "/search" in new_url or
+                    "/feed" in new_url or
+                    new_url.endswith("/") and len(new_url) < len(url_before_click)
+                )
+                
+                if is_accidental:
+                    await ws_manager.broadcast_log(
+                        level="warning",
+                        message=f"Accidental navigation detected. Going back...",
+                        category="browser",
+                        details={"from": url_before_click, "to": new_url},
+                    )
+                    # Go back to the previous page
+                    await agent.page.go_back()
+                    await asyncio.sleep(0.5)
+                    result["recovered"] = True
+                    result["recovery_action"] = "went_back"
+                    result["error"] = f"Clicked wrong link (navigated to {new_url}). Went back. Try a more specific text."
         elif "type" in action_lower or "input" in action_lower or "fill" in action_lower:
             result = await agent.type_text(
                 params.get("selector", ""),
                 params.get("text", params.get("value", "")),
             )
         elif "extract" in action_lower or "get_text" in action_lower or "scrape" in action_lower:
-            # Handle extract, extract_data, get_text, etc.
+            # Smart extraction with answer verification
+            # 1. Extract content
+            # 2. Check if it answers the user's question
+            # 3. If not, take action to get more info
+            # 4. Verify we have what was asked for
+            import re
+            
             # Auto-switch to correct tab if target_url is specified
             target_url = params.get("target_url", params.get("url_contains", ""))
             if target_url:
@@ -645,16 +688,172 @@ async def browser_node(state: AgentState) -> dict:
             
             selector = params.get("selector")
             all_matches = params.get("all", False)
-            result = await agent.extract(
-                selector=selector,
-                attribute=params.get("attribute"),
-                all=all_matches,
-            )
-            # Include which page was extracted from
+            max_attempts = params.get("max_expand", 50)
+            
+            # Get user's original question
+            original_question = ""
+            for msg in state.get("messages", []):
+                if isinstance(msg, HumanMessage):
+                    original_question = msg.content.lower()
+                    break
+            
+            # Determine what the user is looking for
+            looking_for = []
+            if "patent" in original_question:
+                looking_for.append("patents")
+            if "experience" in original_question or "work" in original_question or "job" in original_question:
+                looking_for.append("experience")
+            if "skill" in original_question:
+                looking_for.append("skills")
+            if "education" in original_question or "degree" in original_question:
+                looking_for.append("education")
+            if not looking_for:
+                looking_for.append("general")  # Generic extraction
+            
+            print(f"[BROWSER] User is looking for: {looking_for}")
+            print(f"[BROWSER] Question: {original_question[:100]}")
+            
+            tried_actions = set()
+            attempt_count = 0
+            pages_visited = []
+            
+            # Initial extraction
+            result = await agent.extract(selector=selector, attribute=params.get("attribute"), all=all_matches)
+            pages_visited.append(agent.page.url if agent.page else "unknown")
+            
+            def has_detailed_answer(content: str, looking_for: list) -> tuple[bool, str]:
+                """Check if content has detailed answer (not just summary counts)."""
+                for item in looking_for:
+                    if item == "patents":
+                        # Check if we have actual patent names/numbers, not just "7 patents awarded"
+                        has_count_only = bool(re.search(r'\d+\s*patents?\s*(awarded|published)', content, re.I))
+                        has_details = bool(re.search(r'(patent\s*#|US\d{6,}|patent.*title|inventor)', content, re.I))
+                        # Also check for patent listing patterns
+                        has_list = len(re.findall(r'patent', content, re.I)) > 5
+                        if has_count_only and not (has_details or has_list):
+                            return False, "patents (only count, no details)"
+                    elif item == "experience":
+                        has_count_only = bool(re.search(r'\d+\s*(years?|experiences?)\b', content, re.I))
+                        has_details = bool(re.search(r'(manager|engineer|developer|analyst|director|worked at|position)', content, re.I))
+                        if has_count_only and not has_details:
+                            return False, "experience (only count, no details)"
+                return True, "complete"
+            
+            def find_action_for_missing_info(content: str, missing: str, tried: set) -> tuple[str, str]:
+                """Find what action to take to get missing info."""
+                # Look for clickable elements related to the missing info
+                if "patent" in missing:
+                    # Try to find patent section link
+                    patterns = [
+                        (r'(\d+\s*patents?\s*awarded)', "section_link"),
+                        (r'(\d+\s*patent\s*applications?)', "section_link"),
+                        (r'(Show all \d+\s*patents?)', "expand"),
+                        (r'(Patents)', "section_header"),
+                    ]
+                elif "experience" in missing:
+                    patterns = [
+                        (r'(Show all \d+\s*experiences?)', "expand"),
+                        (r'(\d+\s*experiences?)', "section_link"),
+                        (r'(Experience)', "section_header"),
+                    ]
+                else:
+                    patterns = [
+                        (r'(Show all \d+[^"\n]{0,20})', "expand"),
+                        (r'(Load more)', "expand"),
+                        (r'(See more)', "expand"),
+                    ]
+                
+                for pattern, action_type in patterns:
+                    match = re.search(pattern, content, re.I)
+                    if match:
+                        text = match.group(1).strip()
+                        action_key = f"{action_type}:{text}"
+                        if action_key not in tried:
+                            return action_type, text
+                
+                return None, None
+            
+            # Main loop: extract → verify → take action if needed
+            while attempt_count < max_attempts:
+                page_content = result.get("text", "")
+                current_url = agent.page.url if agent.page else ""
+                
+                # Check if we have the answer
+                has_answer, missing = has_detailed_answer(page_content, looking_for)
+                
+                if has_answer:
+                    print(f"[BROWSER] Found detailed answer after {attempt_count} attempts")
+                    await ws_manager.broadcast_log(
+                        level="info",
+                        message=f"Found detailed information after {attempt_count} attempts",
+                        category="browser",
+                    )
+                    break
+                
+                # We don't have the answer, find action to take
+                action_type, action_text = find_action_for_missing_info(page_content, missing, tried_actions)
+                
+                if not action_type:
+                    print(f"[BROWSER] No more actions to try for: {missing}")
+                    await ws_manager.broadcast_log(
+                        level="warning",
+                        message=f"Could not find detailed {missing}. Returning available data.",
+                        category="browser",
+                    )
+                    break
+                
+                attempt_count += 1
+                action_key = f"{action_type}:{action_text}"
+                tried_actions.add(action_key)
+                
+                await ws_manager.broadcast_log(
+                    level="info",
+                    message=f"[{attempt_count}/{max_attempts}] Missing {missing}. Clicking: '{action_text}'",
+                    category="browser",
+                )
+                print(f"[BROWSER] Attempt {attempt_count}: {action_type} on '{action_text}'")
+                
+                # Remember URL before action
+                url_before = current_url
+                
+                # Scroll and click
+                await agent.scroll(direction="down", amount=300)
+                click_result = await agent.click(text=action_text)
+                
+                if click_result.get("error"):
+                    print(f"[BROWSER] Click failed: {click_result.get('error')}")
+                    continue
+                
+                # Wait for content to load
+                url_after = agent.page.url if agent.page else ""
+                if url_after != url_before:
+                    print(f"[BROWSER] Navigated: {url_before} -> {url_after}")
+                    await asyncio.sleep(1.5)  # Longer wait for page navigation
+                    pages_visited.append(url_after)
+                else:
+                    await asyncio.sleep(0.5)
+                
+                # Extract again
+                result = await agent.extract(selector=selector, attribute=params.get("attribute"), all=all_matches)
+            
+            # Final verification
+            final_content = result.get("text", "")
+            has_answer, missing = has_detailed_answer(final_content, looking_for)
+            
+            # Add metadata
             result["extracted_from"] = {
                 "url": agent.page.url if agent.page else None,
                 "title": await agent.page.title() if agent.page else None,
             }
+            result["attempts"] = attempt_count
+            result["pages_visited"] = pages_visited
+            result["actions_tried"] = list(tried_actions)
+            result["answer_complete"] = has_answer
+            result["looking_for"] = looking_for
+            if not has_answer:
+                result["missing"] = missing
+            
+            print(f"[BROWSER] Extraction complete: answer_complete={has_answer}, attempts={attempt_count}")
         elif "screenshot" in action_lower or "capture" in action_lower:
             result = await agent.screenshot()
         elif "scroll" in action_lower:
@@ -746,6 +945,7 @@ async def browser_node(state: AgentState) -> dict:
             next_subtask = subtasks[next_index]
             next_action = next_subtask.get("agent", "coordinator")
         else:
+            # Browser handles expansion loop internally, go directly to summarize
             next_action = "summarize"
         
         return_state = {
@@ -855,76 +1055,88 @@ async def file_node(state: AgentState) -> dict:
 
 
 async def summarize_node(state: AgentState) -> dict:
-    """Summarize the results of all subtasks."""
+    """Summarize the results and answer the user's original question."""
     llm = create_llm()
     
     results = state.get("results", [])
     error = state.get("error")
     coordinator_id = state.get("coordinator_id")
+    retry_count = state.get("retry_count", 0)
+    
+    # Get the user's original question from the conversation
+    original_question = ""
+    for msg in state.get("messages", []):
+        if isinstance(msg, HumanMessage):
+            original_question = msg.content
+            break
     
     if not results and not error:
-        # Mark coordinator as complete and remove
         if coordinator_id:
             await ws_manager.broadcast(
                 EventType.AGENT_UPDATE,
-                {
-                    "id": coordinator_id,
-                    "status": "idle",
-                    "summary": "No tasks to execute",
-                },
+                {"id": coordinator_id, "status": "idle", "summary": "No tasks to execute"},
             )
-            await ws_manager.broadcast(
-                EventType.AGENT_REMOVED,
-                {"id": coordinator_id},
-            )
+            await ws_manager.broadcast(EventType.AGENT_REMOVED, {"id": coordinator_id})
         return {"next_action": "end"}
     
     # Update coordinator status
     if coordinator_id:
         await ws_manager.broadcast(
             EventType.AGENT_UPDATE,
-            {
-                "id": coordinator_id,
-                "status": "busy",
-                "summary": "Summarizing results...",
-            },
+            {"id": coordinator_id, "status": "busy", "summary": "Generating answer..."},
         )
     
-    # Create a summary prompt that preserves data
-    # Convert results to a more readable format
-    results_str = str(results)
+    # Extract page content from results
+    page_content = ""
+    for r in results:
+        if isinstance(r, dict):
+            result = r.get("result", r)
+            if isinstance(result, dict):
+                if "text" in result:
+                    page_content = result["text"]
+                    break
+                elif "results" in result:
+                    page_content = str(result["results"])
+                    break
     
-    # Check if results contain extracted text (likely has actual content to show)
-    has_extracted_text = any(
-        isinstance(r, dict) and ("text" in r or "results" in r)
-        for r in results if isinstance(r, dict)
-    )
+    if not page_content:
+        page_content = str(results)[:50000]
     
-    if has_extracted_text:
-        # User likely wants to see the actual data
-        summary_prompt = f"""The user requested data extraction. Here are the results:
+    print(f"[SUMMARIZE] Answering after {retry_count} attempts")
+    print(f"[SUMMARIZE] Content length: {len(page_content)} chars")
+    
+    if retry_count > 0:
+        await ws_manager.broadcast_log(
+            level="info",
+            message=f"Answering after {retry_count} navigation attempts.",
+            category="coordinator",
+        )
+    
+    # Create a prompt that answers the user's question
+    summary_prompt = f"""USER'S QUESTION: {original_question}
 
-{results_str[:80000]}
+PAGE CONTENT EXTRACTED:
+{page_content[:60000]}
 
-Create a response that:
-1. Briefly describes what was done (1-2 sentences)
-2. INCLUDES THE ACTUAL EXTRACTED DATA - lists, titles, text, etc.
-3. If there's a list of items (like patent titles, names, etc.), format them clearly
-4. Don't just say "found X items" - SHOW the items
+TASK: Answer the user's question based on the page content above.
 
-{"Error encountered: " + error if error else ""}"""
-    else:
-        summary_prompt = f"""Summarize what was accomplished:
+INSTRUCTIONS:
+1. Find the specific information the user asked about
+2. List ALL items if asked for a list (patents, experiences, skills, etc.)
+3. Format clearly with bullet points or numbered lists
+4. If data seems incomplete or truncated, mention that
 
-Results:
-{results_str[:20000]}
+{"Error encountered: " + error if error else ""}
 
-{"Error: " + error if error else ""}
-
-Provide a brief, user-friendly summary of what was done."""
+Answer:"""
 
     messages = [
-        SystemMessage(content="You are a helpful assistant. When data was extracted, ALWAYS include the actual data in your response, not just a summary of it."),
+        SystemMessage(content="""You are a helpful assistant analyzing extracted web page content.
+Your job is to ANSWER THE USER'S QUESTION based on the content, not just describe what was extracted.
+- If they asked about patents, LIST the patent names (all of them if available)
+- If they asked about experience, summarize it
+- If they asked for specific data, provide that data
+- Be direct and answer what was asked."""),
         HumanMessage(content=summary_prompt),
     ]
     
@@ -973,8 +1185,6 @@ def route_next_action(state: AgentState) -> str:
         return "browser"
     elif next_action == "file":
         return "file"
-    elif next_action == "mcp":
-        return "mcp"  # TODO: implement MCP node
     elif next_action == "summarize":
         return "summarize"
     elif next_action == "coordinator":
@@ -984,12 +1194,18 @@ def route_next_action(state: AgentState) -> str:
 
 
 def create_agent_graph() -> StateGraph:
-    """Create the LangGraph agent workflow."""
+    """Create the LangGraph agent workflow.
+    
+    Flow:
+    1. Coordinator analyzes request and creates subtasks
+    2. Browser/File executes (browser handles expansion loop internally)
+    3. Summarize answers the question
+    """
     
     # Create the graph
     workflow = StateGraph(AgentState)
     
-    # Add nodes
+    # Add nodes (browser handles expansion loop internally, no analyze node needed)
     workflow.add_node("coordinator", coordinator_node)
     workflow.add_node("browser", browser_node)
     workflow.add_node("file", file_node)
@@ -1011,26 +1227,24 @@ def create_agent_graph() -> StateGraph:
         },
     )
     
-    # Add conditional edges from browser
+    # Browser goes to summarize when done (handles expansion loop internally)
     workflow.add_conditional_edges(
         "browser",
         route_next_action,
         {
             "browser": "browser",
-            "file": "file",
             "summarize": "summarize",
             "coordinator": "coordinator",
             "end": END,
         },
     )
     
-    # Add conditional edges from file
+    # File goes to summarize when done
     workflow.add_conditional_edges(
         "file",
         route_next_action,
         {
             "browser": "browser",
-            "file": "file",
             "summarize": "summarize",
             "coordinator": "coordinator",
             "end": END,
@@ -1051,6 +1265,12 @@ class AgentOrchestrator:
         self.memory = MemorySaver()
         self.graph = self.workflow.compile(checkpointer=self.memory)
         self.sessions: dict[str, str] = {}  # session_id -> thread_id
+        self.cancelled_sessions: set[str] = set()  # Track cancelled sessions
+    
+    def cancel_session(self, session_id: str) -> None:
+        """Mark a session as cancelled."""
+        print(f"[ORCHESTRATOR] 🛑 Cancelling session: {session_id}")
+        self.cancelled_sessions.add(session_id)
     
     def _get_thread_id(self, session_id: str) -> str:
         """Get or create a thread ID for a session."""
@@ -1065,8 +1285,14 @@ class AgentOrchestrator:
         self,
         message: str,
         session_id: str = "default",
+        cancel_event: Optional[Any] = None,  # asyncio.Event
     ) -> str:
         """Process a user message through the agent graph."""
+        import asyncio
+        
+        # Clear any previous cancellation for this session
+        self.cancelled_sessions.discard(session_id)
+        
         thread_id = self._get_thread_id(session_id)
         config = {"configurable": {"thread_id": thread_id}}
         
@@ -1085,13 +1311,37 @@ class AgentOrchestrator:
             "error": None,
             "coordinator_id": None,
             "selected_tab_index": None,
+            "retry_count": 0,
+            "max_retries": 50,
+            "tried_approaches": [],
         }
         
         try:
             print(f"[ORCHESTRATOR] Running graph.ainvoke for session {session_id}...")
-            # Run the graph
-            final_state = await self.graph.ainvoke(input_state, config)
+            
+            # Check for cancellation before starting
+            if cancel_event and cancel_event.is_set():
+                print(f"[ORCHESTRATOR] 🛑 Cancelled before start")
+                raise asyncio.CancelledError("Request cancelled by user")
+            
+            # Run the graph with periodic cancellation checks
+            # Use astream for better cancellation support
+            final_state = None
+            async for state in self.graph.astream(input_state, config, stream_mode="values"):
+                # Check for cancellation after each step
+                if cancel_event and cancel_event.is_set():
+                    print(f"[ORCHESTRATOR] 🛑 Cancelled during processing")
+                    raise asyncio.CancelledError("Request cancelled by user")
+                if session_id in self.cancelled_sessions:
+                    print(f"[ORCHESTRATOR] 🛑 Cancelled via cancel_session")
+                    raise asyncio.CancelledError("Request cancelled by user")
+                final_state = state
+            
             print(f"[ORCHESTRATOR] Graph completed!")
+            
+            if not final_state:
+                print(f"[ORCHESTRATOR] No final state, returning 'Task completed.'")
+                return "Task completed."
             
             # Extract the response
             messages = final_state.get("messages", [])
@@ -1104,6 +1354,9 @@ class AgentOrchestrator:
             
             print(f"[ORCHESTRATOR] No messages, returning 'Task completed.'")
             return "Task completed."
+        except asyncio.CancelledError:
+            print(f"[ORCHESTRATOR] 🛑 Request cancelled")
+            raise
         except Exception as e:
             print(f"[ORCHESTRATOR] ❌ Exception: {e}")
             await ws_manager.broadcast_log(
@@ -1112,6 +1365,9 @@ class AgentOrchestrator:
                 category="coordinator",
             )
             raise
+        finally:
+            # Clean up cancelled flag
+            self.cancelled_sessions.discard(session_id)
     
     async def stream_message(
         self,
