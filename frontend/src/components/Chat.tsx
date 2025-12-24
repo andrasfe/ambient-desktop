@@ -166,7 +166,7 @@ export function Chat({ onSendMessage, onCancelRequest }: ChatProps) {
               <div className="absolute top-2 right-2">
                 <CopyButton text={msg.content} />
               </div>
-              <p className="text-sm whitespace-pre-wrap font-mono leading-relaxed pr-6">
+              <p className="text-sm whitespace-pre-wrap break-words font-mono leading-relaxed pr-6 overflow-hidden">
                 {msg.content || ''}
               </p>
               <p className="text-[10px] text-void-500 mt-2">
