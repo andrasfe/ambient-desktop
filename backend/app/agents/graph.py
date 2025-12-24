@@ -12,7 +12,19 @@ from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, Base
 
 from ..config import settings
 from ..services.websocket import ws_manager, EventType
+
+# Import legacy BrowserAgent for fallback and browser context detection
 from .browser import BrowserAgent
+
+# Browser-use is used for AI-native browser automation
+# Falls back to custom BrowserAgent if browser-use is not available
+try:
+    from browser_use import Agent as BrowserUseAgent, Browser as BrowserUseBrowser
+    BROWSER_USE_AVAILABLE = True
+except ImportError:
+    BROWSER_USE_AVAILABLE = False
+    BrowserUseAgent = None
+    BrowserUseBrowser = None
 
 
 class AgentState(TypedDict):
@@ -100,42 +112,33 @@ def sanitize_for_llm(data: dict) -> dict:
 # System prompts
 COORDINATOR_SYSTEM_PROMPT = """You are an AI coordinator that orchestrates computer automation tasks.
 
-CRITICAL RULES:
-1. EXTRACT FIRST: Always start by extracting the current page content
-2. The system will automatically detect incomplete data and expand sections as needed
-3. NEVER use "list_tabs" unless user explicitly asks to list tabs
-4. NEVER use "navigate" unless user gives a specific URL to visit
+The browser agent is AI-powered and will automatically:
+- Scroll through pages to load all content
+- Click "Show more", "Load more", "Show all" buttons
+- Handle lazy-loading and dynamic content
+- Extract complete information
 
 BROWSER agent actions:
-- "extract" - Extract text from current page. params: {} (DEFAULT - use this first!)
-- "scroll" - Scroll the page. params: {"direction": "down"} or {"section": "SectionName"}
-- "click" - Click an element. params: {"text": "EXACT TEXT FROM PAGE"}
-- "switch_tab" - Switch to a tab. params: {"url_contains": "domain.com"}
-- "navigate" - Go to a URL. params: {"url": "https://..."} (ONLY if user provides URL)
+- "extract" - Extract and find information from current page. The AI browser will automatically scroll and expand sections.
+- "navigate" - Go to a URL. params: {"url": "https://..."}
+- "click" - Click an element. params: {"text": "button text"}
 - "type" - Type into input. params: {"selector": "input", "text": "text"}
 - "screenshot" - Take screenshot. params: {}
 
-APPROACH:
-1. Use "extract" to get page content
-2. System automatically handles expanding sections if data is incomplete
-3. Analyze and answer the user's question
-
 Respond with a JSON object:
 {
-    "understanding": "Brief summary",
+    "understanding": "Brief summary of what user wants",
     "subtasks": [{"agent": "browser", "action": "extract", "params": {}}],
     "response": "What to tell the user"
 }
 
 EXAMPLES:
 
-User: "what stocks are in this portfolio?" → extract first, system expands if needed
-User: "list all the items on this page" → extract first
-User: "show me the content" → extract
+User: "list all patents on this page" → {"agent": "browser", "action": "extract", "params": {}}
+User: "go to google.com" → {"agent": "browser", "action": "navigate", "params": {"url": "https://google.com"}}
 
 IMPORTANT: 
-- Always start with "extract" - keep it simple
-- System automatically detects and expands incomplete sections (e.g., "Show all", "Load more")
+- For most questions, just use "extract" - the AI browser handles the rest
 - NEVER output raw tool-call markup"""
 
 # Some OpenRouter models sometimes emit raw "tool call" markup (e.g. <|tool_call_begin|>).
@@ -561,9 +564,15 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
 
 
 async def browser_node(state: AgentState) -> dict:
-    """Browser agent node - executes browser automation tasks."""
+    """Browser agent node - uses browser-use for AI-native browser automation.
+    
+    Browser-use handles all the complexity:
+    - Automatic scrolling and lazy-loading
+    - Smart element detection and clicking
+    - Navigation recovery
+    - Optimized extraction for AI
+    """
     import asyncio
-    from .browser import BrowserAgent
     
     subtasks = state.get("subtasks", [])
     index = state.get("current_subtask_index", 0)
@@ -572,369 +581,30 @@ async def browser_node(state: AgentState) -> dict:
         return {"next_action": "end"}
     
     subtask = subtasks[index]
+    action = subtask.get("action", "")
+    params = subtask.get("params", {})
     
     await ws_manager.broadcast_log(
         level="info",
-        message=f"Browser executing: {subtask.get('action')}",
+        message=f"Browser executing: {action}",
         category="browser",
-        details=subtask.get("params"),
+        details=params,
     )
     
-    # Create browser agent with configured settings
-    # Prioritize: CDP (take over existing) > persistent context > fresh browser
-    agent = BrowserAgent(
-        cdp_url=settings.browser_cdp_url or None,
-        user_data_dir=settings.browser_user_data_dir or None,
-        headless=settings.browser_headless,
-    )
+    # Get user's original question to form the task
+    original_question = ""
+    for msg in state.get("messages", []):
+        if isinstance(msg, HumanMessage):
+            original_question = msg.content
+            break
+    
     try:
-        await agent.start()
-        
-        # Restore previously selected tab if available (for multi-step workflows)
-        selected_tab_index = state.get("selected_tab_index")
-        if selected_tab_index is not None:
-            try:
-                await agent.use_existing_page(selected_tab_index)
-                await ws_manager.broadcast_log(
-                    level="debug",
-                    message=f"Restored tab selection: index {selected_tab_index}",
-                    category="browser",
-                )
-            except Exception:
-                pass  # Tab might not exist anymore
-        
-        # Map subtask to browser action
-        action = subtask.get("action", "")
-        params = subtask.get("params", {})
-        
-        result = {}
-        action_lower = action.lower()
-        
-        # Track tab selection for persistence across subtasks
-        new_selected_tab_index = state.get("selected_tab_index")
-        
-        if "navigate" in action_lower or "go to" in action_lower or "go_to" in action_lower:
-            url = params.get("url", params.get("target", ""))
-            if url:
-                result = await agent.navigate(url)
-            else:
-                result = {"error": "No URL provided for navigate action"}
-        elif "click" in action_lower or "find_element" in action_lower:
-            # find_element is treated as click since it's usually followed by interaction
-            selector = params.get("selector")
-            text = params.get("text", params.get("description", ""))
-            section = params.get("section")
-            
-            # Remember the URL before clicking to detect accidental navigation
-            url_before_click = agent.page.url if agent.page else None
-            
-            result = await agent.click(selector=selector, text=text if not selector else None, section=section)
-            
-            # Check if we accidentally navigated away
-            if result.get("navigated") and url_before_click:
-                new_url = result.get("url", "")
-                # If we navigated to a completely different domain or a different page type, go back
-                from urllib.parse import urlparse
-                old_domain = urlparse(url_before_click).netloc
-                new_domain = urlparse(new_url).netloc
-                
-                # Detect accidental navigation (different domain, or went to a list/search page)
-                is_accidental = (
-                    old_domain != new_domain or
-                    "/search" in new_url or
-                    "/feed" in new_url or
-                    new_url.endswith("/") and len(new_url) < len(url_before_click)
-                )
-                
-                if is_accidental:
-                    await ws_manager.broadcast_log(
-                        level="warning",
-                        message=f"Accidental navigation detected. Going back...",
-                        category="browser",
-                        details={"from": url_before_click, "to": new_url},
-                    )
-                    # Go back to the previous page
-                    await agent.page.go_back()
-                    await asyncio.sleep(0.5)
-                    result["recovered"] = True
-                    result["recovery_action"] = "went_back"
-                    result["error"] = f"Clicked wrong link (navigated to {new_url}). Went back. Try a more specific text."
-        elif "type" in action_lower or "input" in action_lower or "fill" in action_lower:
-            result = await agent.type_text(
-                params.get("selector", ""),
-                params.get("text", params.get("value", "")),
-            )
-        elif "extract" in action_lower or "get_text" in action_lower or "scrape" in action_lower:
-            # Smart extraction with answer verification
-            # 1. Extract content
-            # 2. Check if it answers the user's question
-            # 3. If not, take action to get more info
-            # 4. Verify we have what was asked for
-            import re
-            
-            # Auto-switch to correct tab if target_url is specified
-            target_url = params.get("target_url", params.get("url_contains", ""))
-            if target_url:
-                pages = await agent.list_pages()
-                for page_info in pages:
-                    if target_url.lower() in page_info.get("url", "").lower():
-                        await agent.use_existing_page(page_info["index"])
-                        await ws_manager.broadcast_log(
-                            level="info",
-                            message=f"Auto-switched to tab: {page_info.get('title', page_info['url'])}",
-                            category="browser",
-                        )
-                        break
-            
-            selector = params.get("selector")
-            all_matches = params.get("all", False)
-            max_attempts = params.get("max_expand", 50)
-            
-            # Get user's original question
-            original_question = ""
-            for msg in state.get("messages", []):
-                if isinstance(msg, HumanMessage):
-                    original_question = msg.content.lower()
-                    break
-            
-            # Determine what the user is looking for
-            looking_for = []
-            if "patent" in original_question:
-                looking_for.append("patents")
-            if "experience" in original_question or "work" in original_question or "job" in original_question:
-                looking_for.append("experience")
-            if "skill" in original_question:
-                looking_for.append("skills")
-            if "education" in original_question or "degree" in original_question:
-                looking_for.append("education")
-            if not looking_for:
-                looking_for.append("general")  # Generic extraction
-            
-            print(f"[BROWSER] User is looking for: {looking_for}")
-            print(f"[BROWSER] Question: {original_question[:100]}")
-            
-            tried_actions = set()
-            attempt_count = 0
-            pages_visited = []
-            
-            # Initial extraction
-            result = await agent.extract(selector=selector, attribute=params.get("attribute"), all=all_matches)
-            pages_visited.append(agent.page.url if agent.page else "unknown")
-            
-            def has_detailed_answer(content: str, looking_for: list) -> tuple[bool, str]:
-                """Check if content has detailed answer (not just summary counts)."""
-                for item in looking_for:
-                    if item == "patents":
-                        # Check if we have actual patent names/numbers, not just "7 patents awarded"
-                        has_count_only = bool(re.search(r'\d+\s*patents?\s*(awarded|published)', content, re.I))
-                        has_details = bool(re.search(r'(patent\s*#|US\d{6,}|patent.*title|inventor)', content, re.I))
-                        # Also check for patent listing patterns
-                        has_list = len(re.findall(r'patent', content, re.I)) > 5
-                        if has_count_only and not (has_details or has_list):
-                            return False, "patents (only count, no details)"
-                    elif item == "experience":
-                        has_count_only = bool(re.search(r'\d+\s*(years?|experiences?)\b', content, re.I))
-                        has_details = bool(re.search(r'(manager|engineer|developer|analyst|director|worked at|position)', content, re.I))
-                        if has_count_only and not has_details:
-                            return False, "experience (only count, no details)"
-                return True, "complete"
-            
-            def find_action_for_missing_info(content: str, missing: str, tried: set) -> tuple[str, str]:
-                """Find what action to take to get missing info."""
-                # Look for clickable elements related to the missing info
-                if "patent" in missing:
-                    # Try to find patent section link
-                    patterns = [
-                        (r'(\d+\s*patents?\s*awarded)', "section_link"),
-                        (r'(\d+\s*patent\s*applications?)', "section_link"),
-                        (r'(Show all \d+\s*patents?)', "expand"),
-                        (r'(Patents)', "section_header"),
-                    ]
-                elif "experience" in missing:
-                    patterns = [
-                        (r'(Show all \d+\s*experiences?)', "expand"),
-                        (r'(\d+\s*experiences?)', "section_link"),
-                        (r'(Experience)', "section_header"),
-                    ]
-                else:
-                    patterns = [
-                        (r'(Show all \d+[^"\n]{0,20})', "expand"),
-                        (r'(Load more)', "expand"),
-                        (r'(See more)', "expand"),
-                    ]
-                
-                for pattern, action_type in patterns:
-                    match = re.search(pattern, content, re.I)
-                    if match:
-                        text = match.group(1).strip()
-                        action_key = f"{action_type}:{text}"
-                        if action_key not in tried:
-                            return action_type, text
-                
-                return None, None
-            
-            # Main loop: extract → verify → take action if needed
-            while attempt_count < max_attempts:
-                page_content = result.get("text", "")
-                current_url = agent.page.url if agent.page else ""
-                
-                # Check if we have the answer
-                has_answer, missing = has_detailed_answer(page_content, looking_for)
-                
-                if has_answer:
-                    print(f"[BROWSER] Found detailed answer after {attempt_count} attempts")
-                    await ws_manager.broadcast_log(
-                        level="info",
-                        message=f"Found detailed information after {attempt_count} attempts",
-                        category="browser",
-                    )
-                    break
-                
-                # We don't have the answer, find action to take
-                action_type, action_text = find_action_for_missing_info(page_content, missing, tried_actions)
-                
-                if not action_type:
-                    print(f"[BROWSER] No more actions to try for: {missing}")
-                    await ws_manager.broadcast_log(
-                        level="warning",
-                        message=f"Could not find detailed {missing}. Returning available data.",
-                        category="browser",
-                    )
-                    break
-                
-                attempt_count += 1
-                action_key = f"{action_type}:{action_text}"
-                tried_actions.add(action_key)
-                
-                await ws_manager.broadcast_log(
-                    level="info",
-                    message=f"[{attempt_count}/{max_attempts}] Missing {missing}. Clicking: '{action_text}'",
-                    category="browser",
-                )
-                print(f"[BROWSER] Attempt {attempt_count}: {action_type} on '{action_text}'")
-                
-                # Remember URL before action
-                url_before = current_url
-                
-                # Scroll and click
-                await agent.scroll(direction="down", amount=300)
-                click_result = await agent.click(text=action_text)
-                
-                if click_result.get("error"):
-                    print(f"[BROWSER] Click failed: {click_result.get('error')}")
-                    continue
-                
-                # Wait for content to load
-                url_after = agent.page.url if agent.page else ""
-                if url_after != url_before:
-                    print(f"[BROWSER] Navigated: {url_before} -> {url_after}")
-                    await asyncio.sleep(1.5)  # Longer wait for page navigation
-                    pages_visited.append(url_after)
-                else:
-                    await asyncio.sleep(0.5)
-                
-                # Extract again
-                result = await agent.extract(selector=selector, attribute=params.get("attribute"), all=all_matches)
-            
-            # Final verification
-            final_content = result.get("text", "")
-            has_answer, missing = has_detailed_answer(final_content, looking_for)
-            
-            # Add metadata
-            result["extracted_from"] = {
-                "url": agent.page.url if agent.page else None,
-                "title": await agent.page.title() if agent.page else None,
-            }
-            result["attempts"] = attempt_count
-            result["pages_visited"] = pages_visited
-            result["actions_tried"] = list(tried_actions)
-            result["answer_complete"] = has_answer
-            result["looking_for"] = looking_for
-            if not has_answer:
-                result["missing"] = missing
-            
-            print(f"[BROWSER] Extraction complete: answer_complete={has_answer}, attempts={attempt_count}")
-        elif "screenshot" in action_lower or "capture" in action_lower:
-            result = await agent.screenshot()
-        elif "scroll" in action_lower:
-            # Handle scroll, scroll_to, scroll_to_section, etc.
-            # IMPORTANT: params["section"] (e.g. "Patents") is NOT a CSS selector.
-            # Use BrowserAgent.scroll(), which supports scrolling to a selector OR a named section.
-            result = await agent.scroll(
-                direction=params.get("direction", "down"),
-                amount=int(params.get("amount", 500) or 500),
-                selector=params.get("selector"),
-                to_bottom=bool(params.get("to_bottom", False)),
-                section=params.get("section"),
-            )
-        elif "wait" in action_lower:
-            selector = params.get("selector")
-            timeout = params.get("timeout", 5000)
-            if selector:
-                await agent.page.wait_for_selector(selector, timeout=timeout)
-                result = {"waited_for": selector}
-            else:
-                import asyncio
-                await asyncio.sleep(timeout / 1000)
-                result = {"waited_ms": timeout}
-        elif "list" in action_lower and ("tab" in action_lower or "page" in action_lower):
-            # List open tabs/pages
-            pages = await agent.list_pages()
-            result = {"tabs": pages, "count": len(pages)}
-        elif "switch" in action_lower or "select_tab" in action_lower:
-            # Switch to a specific tab by index or URL pattern
-            url_contains = params.get("url_contains", params.get("url_pattern", ""))
-            page_index = params.get("index", params.get("page_index"))
-            
-            if url_contains:
-                # Find tab by URL pattern
-                pages = await agent.list_pages()
-                found_index = None
-                for page_info in pages:
-                    if url_contains.lower() in page_info.get("url", "").lower():
-                        found_index = page_info["index"]
-                        break
-                
-                if found_index is not None:
-                    result = await agent.use_existing_page(found_index)
-                    result["matched_pattern"] = url_contains
-                    new_selected_tab_index = found_index
-                else:
-                    result = {"error": f"No tab found matching: {url_contains}", "available_tabs": pages}
-            elif page_index is not None:
-                result = await agent.use_existing_page(page_index)
-                new_selected_tab_index = page_index
-            else:
-                result = {"error": "switch_tab requires 'index' or 'url_contains' parameter"}
-        elif "current" in action_lower or "url" in action_lower:
-            # Get current page info
-            result = {
-                "url": agent.page.url if agent.page else None,
-                "title": await agent.page.title() if agent.page else None,
-            }
-        elif "evaluate" in action_lower or "javascript" in action_lower or "js" in action_lower:
-            # Execute JavaScript
-            script = params.get("script", params.get("code", ""))
-            if script:
-                result = {"result": await agent.page.evaluate(script)}
-            else:
-                result = {"error": "No script provided"}
-        elif "edit_fields" in action_lower or ("edit" in action_lower and "field" in action_lower):
-            # Generic edit: locate an item by match_text and set/swap fields
-            match_text = params.get("match_text")
-            if not match_text:
-                result = {"error": "edit_fields requires match_text"}
-            else:
-                result = await agent.edit_fields(
-                    match_text=match_text,
-                    fields=params.get("fields") or None,
-                    swap=params.get("swap") or None,
-                    open_edit_texts=params.get("open_edit_texts") or None,
-                    save_texts=params.get("save_texts") or None,
-                    timeout=int(params.get("timeout", 15000) or 15000),
-                )
+        if BROWSER_USE_AVAILABLE:
+            # Use browser-use for AI-native automation
+            result = await _run_browser_use_task(action, params, original_question)
         else:
-            result = {"error": f"Unknown action: {action}", "hint": "Use: navigate, click, type, extract, screenshot, scroll, wait, list_tabs, switch_tab"}
+            # Fallback to custom BrowserAgent
+            result = await _run_legacy_browser_task(state, subtask)
         
         results = state.get("results", [])
         results.append({"subtask": subtask, "result": result})
@@ -945,21 +615,14 @@ async def browser_node(state: AgentState) -> dict:
             next_subtask = subtasks[next_index]
             next_action = next_subtask.get("agent", "coordinator")
         else:
-            # Browser handles expansion loop internally, go directly to summarize
             next_action = "summarize"
         
-        return_state = {
+        return {
             "results": results,
             "current_subtask_index": next_index,
             "next_action": next_action,
             "messages": [AIMessage(content=f"Browser completed: {action}")],
         }
-        
-        # Persist tab selection for multi-step workflows
-        if new_selected_tab_index is not None:
-            return_state["selected_tab_index"] = new_selected_tab_index
-        
-        return return_state
     except Exception as e:
         await ws_manager.broadcast_log(
             level="error",
@@ -971,6 +634,171 @@ async def browser_node(state: AgentState) -> dict:
             "next_action": "summarize",
             "messages": [AIMessage(content=f"Browser error: {str(e)}")],
         }
+
+
+async def _run_browser_use_task(action: str, params: dict, original_question: str) -> dict:
+    """Run a task using browser-use library."""
+    import asyncio
+    
+    action_lower = action.lower()
+    
+    # Create LLM for browser-use
+    llm = create_llm()
+    
+    browser = None
+    try:
+        # Create browser-use browser with CDP if available
+        if settings.browser_cdp_url:
+            # Connect to existing Chrome via CDP
+            browser = BrowserUseBrowser(
+                cdp_url=settings.browser_cdp_url,
+                headless=settings.browser_headless,
+            )
+        else:
+            browser = BrowserUseBrowser(
+                headless=settings.browser_headless,
+            )
+        
+        # Construct the task based on action type
+        if "extract" in action_lower or "get_text" in action_lower or "scrape" in action_lower:
+            # For extraction, use the original question to guide browser-use
+            task = f"""On the current browser page, complete this task: {original_question}
+
+Important instructions:
+1. First, observe the current page content
+2. Scroll through the entire page to load all content  
+3. Click any "Show more", "Load more", or "Show all" buttons to expand all sections
+4. Extract ALL relevant information, not just the first few items
+5. Make sure you have found EVERYTHING that matches the request
+6. Return the complete data in a structured format"""
+            
+            max_steps = 50
+            
+        elif "navigate" in action_lower:
+            url = params.get("url", params.get("target", ""))
+            task = f"Navigate to {url}"
+            max_steps = 5
+            
+        elif "click" in action_lower:
+            text = params.get("text", params.get("description", ""))
+            task = f"Click on the element with text: {text}"
+            max_steps = 10
+            
+        elif "type" in action_lower or "input" in action_lower:
+            text = params.get("text", params.get("value", ""))
+            selector = params.get("selector", "")
+            task = f"Type '{text}' into the input field {selector}"
+            max_steps = 10
+            
+        else:
+            # Generic task
+            task = f"Complete this browser action: {action}. User question: {original_question}"
+            max_steps = 30
+        
+        await ws_manager.broadcast_log(
+            level="info",
+            message=f"Browser-use task: {task[:100]}...",
+            category="browser",
+        )
+        print(f"[BROWSER-USE] Starting task: {task[:100]}...")
+        
+        # Create and run browser-use agent
+        agent = BrowserUseAgent(
+            task=task,
+            llm=llm,
+            browser=browser,
+            max_actions_per_step=5,
+        )
+        
+        # Run the agent
+        history = await agent.run(max_steps=max_steps)
+        
+        # Extract result
+        if hasattr(history, 'final_result'):
+            final_result = history.final_result()
+        elif hasattr(history, 'result'):
+            final_result = history.result
+        else:
+            final_result = str(history)
+        
+        print(f"[BROWSER-USE] Task completed. Result length: {len(str(final_result))}")
+        
+        return {
+            "success": True,
+            "text": final_result,
+            "task": task,
+            "steps": len(history.history) if hasattr(history, 'history') else 0,
+        }
+        
+    except Exception as e:
+        print(f"[BROWSER-USE] Error: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "success": False,
+            "error": str(e),
+        }
+    finally:
+        if browser:
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+
+async def _run_legacy_browser_task(state: dict, subtask: dict) -> dict:
+    """Fallback: Run task using legacy custom BrowserAgent."""
+    from .browser import BrowserAgent
+    import asyncio
+    
+    action = subtask.get("action", "")
+    params = subtask.get("params", {})
+    action_lower = action.lower()
+    
+    agent = BrowserAgent(
+        cdp_url=settings.browser_cdp_url or None,
+        user_data_dir=settings.browser_user_data_dir or None,
+        headless=settings.browser_headless,
+    )
+    
+    try:
+        await agent.start()
+        
+        if "navigate" in action_lower:
+            url = params.get("url", params.get("target", ""))
+            return await agent.navigate(url) if url else {"error": "No URL provided"}
+            
+        elif "click" in action_lower:
+            return await agent.click(
+                selector=params.get("selector"),
+                text=params.get("text", params.get("description", "")),
+            )
+            
+        elif "type" in action_lower or "input" in action_lower:
+            return await agent.type_text(
+                params.get("selector", ""),
+                params.get("text", params.get("value", "")),
+            )
+            
+        elif "extract" in action_lower:
+            return await agent.extract(
+                selector=params.get("selector"),
+                attribute=params.get("attribute"),
+                all=params.get("all", False),
+            )
+            
+        elif "screenshot" in action_lower:
+            return await agent.screenshot()
+            
+        elif "scroll" in action_lower:
+            return await agent.scroll(
+                direction=params.get("direction", "down"),
+                amount=int(params.get("amount", 500) or 500),
+            )
+            
+        else:
+            return {"error": f"Unknown action: {action}"}
+            
     finally:
         await agent.stop()
 

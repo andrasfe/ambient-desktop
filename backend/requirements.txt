@@ -30,6 +30,7 @@ python-dotenv>=1.0.0
 
 # Browser Automation
 playwright>=1.41.0
+browser-use>=0.11.0
 
 # Utilities
 uuid7>=0.1.0
