@@ -87,22 +87,22 @@ async def process_and_respond(
         print(f"[CHAT-WS] Message: {message[:100]}...")
         print(f"[CHAT-WS] Calling orchestrator.process_message...")
         
-        # Process with timeout (5 minutes max for complex browser tasks)
+        # Process with timeout (30 minutes max for complex browser tasks like large extractions)
         try:
             full_response = await asyncio.wait_for(
                 orchestrator.process_message(message, msg_session, cancel_event),
-                timeout=300.0  # 5 minute timeout
+                timeout=1800.0  # 30 minute timeout for large extractions (83+ patents)
             )
-            
+
             if cancel_event.is_set():
                 print(f"[CHAT-WS] 🛑 Request was cancelled")
                 was_cancelled = True
                 return
-            
+
             print(f"[CHAT-WS] ✅ Got response: {len(full_response)} chars")
         except asyncio.TimeoutError:
-            full_response = "⏱️ Request timed out after 5 minutes. Please try again with a simpler request."
-            print(f"[CHAT-WS] ⏱️ TIMEOUT after 300 seconds")
+            full_response = "⏱️ Request timed out after 30 minutes. Please try again with a simpler request."
+            print(f"[CHAT-WS] ⏱️ TIMEOUT after 1800 seconds")
         except asyncio.CancelledError:
             print(f"[CHAT-WS] 🛑 Request was cancelled (CancelledError)")
             was_cancelled = True

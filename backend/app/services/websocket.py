@@ -146,15 +146,26 @@ class WebSocketManager:
         details: Optional[dict] = None,
     ) -> None:
         """Broadcast a log entry to all clients."""
+        # Truncate long messages to prevent UI layout issues
+        truncated_message = message[:500] + "..." if len(message) > 500 else message
+        truncated_details = None
+        if details:
+            # Truncate details if serialized form is too long
+            details_str = json.dumps(details, default=str)
+            if len(details_str) > 1000:
+                truncated_details = {"truncated": True, "preview": details_str[:500] + "..."}
+            else:
+                truncated_details = details
+
         await self.broadcast(
             EventType.LOG_ENTRY,
             {
                 "level": level,
                 "category": category,
-                "message": message,
+                "message": truncated_message,
                 "agent_id": str(agent_id) if agent_id else None,
                 "task_id": str(task_id) if task_id else None,
-                "details": details,
+                "details": truncated_details,
             },
         )
 
@@ -167,14 +178,28 @@ class WebSocketManager:
         metadata: Optional[dict] = None,
     ) -> None:
         """Broadcast an agent status update."""
+        # Truncate long summaries to prevent UI layout issues
+        truncated_summary = None
+        if summary:
+            truncated_summary = summary[:300] + "..." if len(summary) > 300 else summary
+
+        truncated_metadata = None
+        if metadata:
+            # Truncate metadata if serialized form is too long
+            meta_str = json.dumps(metadata, default=str)
+            if len(meta_str) > 1000:
+                truncated_metadata = {"truncated": True}
+            else:
+                truncated_metadata = metadata
+
         await self.broadcast(
             EventType.AGENT_UPDATE,
             {
                 "id": str(agent_id),
                 "status": status,
-                "summary": summary,
+                "summary": truncated_summary,
                 "progress": progress,
-                "metadata": metadata,
+                "metadata": truncated_metadata,
             },
         )
 

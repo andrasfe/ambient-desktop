@@ -35,12 +35,12 @@ function App() {
         </div>
 
         {/* Center Panel - Chat */}
-        <div className="flex-1 flex flex-col border-r border-void-800 min-w-0">
+        <div className="flex-1 flex flex-col border-r border-void-800 min-w-0 overflow-hidden">
           <Chat onSendMessage={sendMessage} onCancelRequest={cancelRequest} />
         </div>
 
         {/* Right Panel - Logs & Agents */}
-        <div className="w-80 shrink-0 flex flex-col">
+        <div className="w-80 shrink-0 flex flex-col overflow-hidden">
           {/* Agent Status */}
           <div className="h-1/3 border-b border-void-800 overflow-hidden">
             <AgentPanel />

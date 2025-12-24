@@ -32,6 +32,8 @@ To let the agent use your logged-in browser sessions (LinkedIn, Gmail, etc):
 
 The agent will control your existing browser with all your logins intact.
 
+> **Note**: When using browser takeover, open the frontend (localhost:3000) in **Firefox or Safari** instead of Chrome. The agent's browser control affects all Chrome tabs, which can cause UI issues if the frontend is also in Chrome.
+
 ## Scripts
 
 | Script | Description |

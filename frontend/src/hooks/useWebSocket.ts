@@ -2,7 +2,7 @@ import { useEffect, useRef, useCallback } from 'react';
 import { useAgentStore } from '../stores/agentStore';
 
 const WS_URL = `ws://${window.location.hostname}:8000/chat/ws`;
-const RESPONSE_TIMEOUT = 5 * 60 * 1000; // 5 minutes - same as backend timeout
+const RESPONSE_TIMEOUT = 30 * 60 * 1000; // 30 minutes - same as backend timeout for large extractions
 
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);

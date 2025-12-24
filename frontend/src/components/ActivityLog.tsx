@@ -53,7 +53,7 @@ export function ActivityLog() {
       </div>
 
       {/* Logs */}
-      <div ref={containerRef} className="flex-1 overflow-y-auto font-mono text-xs">
+      <div ref={containerRef} className="flex-1 overflow-y-auto overflow-x-hidden font-mono text-xs">
         {logs.length === 0 ? (
           <div className="flex flex-col items-center justify-center h-full text-void-500">
             <Terminal className="w-12 h-12 mb-3 opacity-30" />
@@ -83,16 +83,16 @@ export function ActivityLog() {
                   <div className="flex items-start gap-2">
                     <Icon className={clsx('w-3.5 h-3.5 mt-0.5 shrink-0', colorClass)} />
                     <div className="flex-1 min-w-0">
-                      <div className="flex items-center gap-2">
-                        <span className={clsx('font-medium', colorClass)}>
+                      <div className="flex items-center gap-2 min-w-0">
+                        <span className={clsx('font-medium shrink-0', colorClass)}>
                           [{log.category || 'general'}]
                         </span>
-                        <span className="text-void-400 truncate">
+                        <span className="text-void-400 truncate block">
                           {log.message || ''}
                         </span>
                       </div>
                       {log.details && (
-                        <pre className="mt-1 text-[10px] text-void-500 overflow-x-auto">
+                        <pre className="mt-1 text-[10px] text-void-500 overflow-hidden text-ellipsis whitespace-pre-wrap break-all">
                           {JSON.stringify(log.details, null, 2)}
                         </pre>
                       )}

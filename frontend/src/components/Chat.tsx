@@ -120,7 +120,7 @@ export function Chat({ onSendMessage, onCancelRequest }: ChatProps) {
       </div>
 
       {/* Messages */}
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
+      <div className="flex-1 overflow-y-auto overflow-x-hidden p-4 space-y-4">
         <ChatErrorBoundary>
         {messages.length === 0 && !streamingContent && (
           <div className="flex flex-col items-center justify-center h-full text-void-500">
@@ -184,8 +184,8 @@ export function Chat({ onSendMessage, onCancelRequest }: ChatProps) {
             <div className="w-8 h-8 rounded-lg flex items-center justify-center shrink-0 bg-neon-cyan/20 text-neon-cyan">
               <Loader2 className="w-4 h-4 animate-spin" />
             </div>
-            <div className="max-w-[80%] rounded-xl px-4 py-3 glass">
-              <p className="text-sm whitespace-pre-wrap font-mono leading-relaxed cursor-blink">
+            <div className="max-w-[80%] rounded-xl px-4 py-3 glass overflow-hidden">
+              <p className="text-sm whitespace-pre-wrap break-words font-mono leading-relaxed cursor-blink overflow-hidden">
                 {streamingContent}
               </p>
             </div>

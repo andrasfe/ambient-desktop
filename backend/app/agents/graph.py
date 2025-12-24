@@ -81,12 +81,13 @@ def create_llm():
 
 def create_browser_use_llm():
     """Create the LLM instance for browser-use Agent (uses browser-use's own LLM classes)."""
-    
+
     # Use browser-use's ChatOpenAI for all cases (cloud and local OpenAI-compatible)
     return BrowserUseChatOpenAI(
         model=settings.openrouter_model,
         api_key=settings.openrouter_api_key or "local",
         base_url=settings.openrouter_base_url,
+        timeout=180.0,  # 3 minute timeout for large page extractions (patents list etc.)
         default_headers={
             "HTTP-Referer": "https://ambient-desktop.local",
             "X-Title": "Ambient Desktop Agent",
@@ -287,7 +288,11 @@ async def coordinator_node(state: AgentState) -> dict:
         browser_context = ""
         try:
             if settings.browser_cdp_url:
-                browser = BrowserUseBrowser(cdp_url=settings.browser_cdp_url)
+                browser = BrowserUseBrowser(
+                    cdp_url=settings.browser_cdp_url,
+                    highlight_elements=False,
+                    dom_highlight_elements=False,
+                )
                 await browser.start()
                 
                 current_url = await browser.get_current_page_url()
@@ -637,29 +642,133 @@ async def browser_node(state: AgentState) -> dict:
         }
 
 
+async def _fast_linkedin_patents_extraction(browser) -> dict | None:
+    """Fast path for extracting patents from LinkedIn patents page using direct DOM scraping."""
+    try:
+        # Get current page URL to check if we're on a LinkedIn patents page
+        await browser.start()
+        current_url = await browser.get_current_page_url()
+
+        if not current_url or "/details/patents" not in current_url:
+            return None  # Not on patents page, use normal extraction
+
+        print("[BROWSER-USE] Fast path: LinkedIn patents page detected, using direct DOM extraction")
+
+        # Get the browser context to run JavaScript
+        context = await browser.get_current_context()
+        page = context.pages[0] if context.pages else None
+
+        if not page:
+            return None
+
+        # First scroll the entire page to load all patents
+        await page.evaluate("""
+            async () => {
+                let lastHeight = 0;
+                for (let i = 0; i < 20; i++) {
+                    window.scrollTo(0, document.body.scrollHeight);
+                    await new Promise(r => setTimeout(r, 500));
+                    if (document.body.scrollHeight === lastHeight) break;
+                    lastHeight = document.body.scrollHeight;
+                }
+                window.scrollTo(0, 0);
+            }
+        """)
+
+        # Wait for content to settle
+        import asyncio
+        await asyncio.sleep(2)
+
+        # Extract patents using a robust JavaScript DOM scraper
+        patents_data = await page.evaluate("""
+            () => {
+                const patents = [];
+                // Find all patent entries - they're usually in li elements or divs with patent info
+                const entries = document.querySelectorAll('li[class*="list"], div[class*="pvs-list__paged-list-wrapper"] li');
+
+                for (const entry of entries) {
+                    const text = entry.innerText || '';
+                    // Skip if doesn't look like a patent entry
+                    if (!text.includes('Patent') && !text.includes('US ') && !text.includes('Issued') && !text.includes('Filed')) {
+                        continue;
+                    }
+
+                    // Extract patent info
+                    const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
+                    if (lines.length >= 2) {
+                        const title = lines[0];
+                        const numberAndDate = lines.slice(1).join(' ');
+
+                        // Try to extract patent number
+                        const numberMatch = numberAndDate.match(/(US \\d[\\d,\\s\\/]+[A-Z0-9]*|\\d{10,})/i);
+                        const dateMatch = numberAndDate.match(/(Issued|Filed)[^\\d]*(\\w+ \\d+, \\d{4})/i);
+
+                        patents.push({
+                            title: title,
+                            number: numberMatch ? numberMatch[0].trim() : null,
+                            date_info: dateMatch ? `${dateMatch[1]} ${dateMatch[2]}` : null,
+                            raw: lines.slice(0, 3).join(' | ')
+                        });
+                    }
+                }
+
+                return patents;
+            }
+        """)
+
+        if patents_data and len(patents_data) > 0:
+            print(f"[BROWSER-USE] Fast extraction got {len(patents_data)} patents")
+            import json
+            return {
+                "success": True,
+                "text": json.dumps(patents_data, indent=2),
+                "task": "Direct DOM extraction of LinkedIn patents",
+                "steps": 1,
+                "count": len(patents_data),
+            }
+
+        return None  # Fallback to normal extraction if this didn't work
+
+    except Exception as e:
+        print(f"[BROWSER-USE] Fast extraction failed: {e}")
+        return None  # Fallback to normal extraction
+
+
 async def _run_browser_use_task(action: str, params: dict, original_question: str) -> dict:
     """Run a task using browser-use library."""
     import asyncio
-    
+
     action_lower = (action or "extract").lower()
-    
+
     # Create LLM for browser-use (uses browser-use's own LLM classes)
     llm = create_browser_use_llm()
-    
+
     browser = None
     try:
         # Create browser-use browser with CDP if available
+        # Disable DOM highlighting to reduce interference
         if settings.browser_cdp_url:
             # Connect to existing Chrome via CDP
             browser = BrowserUseBrowser(
                 cdp_url=settings.browser_cdp_url,
                 headless=settings.browser_headless,
+                highlight_elements=False,
+                dom_highlight_elements=False,
             )
         else:
             browser = BrowserUseBrowser(
                 headless=settings.browser_headless,
+                highlight_elements=False,
+                dom_highlight_elements=False,
             )
-        
+
+        # Check for fast extraction paths (LinkedIn patents, etc.)
+        question_lower = original_question.lower()
+        if "patent" in question_lower and ("extract" in action_lower or "get_text" in action_lower):
+            fast_result = await _fast_linkedin_patents_extraction(browser)
+            if fast_result:
+                return fast_result
+
         # Construct the task based on action type
         if "extract" in action_lower or "get_text" in action_lower or "scrape" in action_lower:
             # For extraction, use the original question to guide browser-use
@@ -667,13 +776,13 @@ async def _run_browser_use_task(action: str, params: dict, original_question: st
 
 Important instructions:
 1. First, observe the current page content
-2. Scroll through the entire page to load all content  
+2. Scroll through the entire page to load all content
 3. Click any "Show more", "Load more", or "Show all" buttons to expand all sections
 4. Extract ALL relevant information, not just the first few items
 5. Make sure you have found EVERYTHING that matches the request
 6. Return the complete data in a structured format"""
-            
-            max_steps = 50
+
+            max_steps = 100  # Increased from 50 to handle 80+ items
             
         elif "navigate" in action_lower:
             url = params.get("url", params.get("target", ""))
@@ -692,9 +801,9 @@ Important instructions:
             max_steps = 10
             
         else:
-            # Generic task
+            # Generic task - use high step count since we don't know complexity
             task = f"Complete this browser action: {action}. User question: {original_question}"
-            max_steps = 30
+            max_steps = 100  # Increased for complex extraction tasks
         
         await ws_manager.broadcast_log(
             level="info",
@@ -713,15 +822,37 @@ Important instructions:
         
         # Run the agent
         history = await agent.run(max_steps=max_steps)
-        
-        # Extract result
+
+        # Extract result - try multiple approaches
+        final_result = None
+
+        # Method 1: final_result() method
         if hasattr(history, 'final_result'):
             final_result = history.final_result()
-        elif hasattr(history, 'result'):
+            print(f"[BROWSER-USE] Got result from final_result(): {type(final_result)}")
+
+        # Method 2: result attribute
+        if not final_result and hasattr(history, 'result'):
             final_result = history.result
-        else:
+            print(f"[BROWSER-USE] Got result from result attr: {type(final_result)}")
+
+        # Method 3: Check history for extracted content
+        if not final_result and hasattr(history, 'history'):
+            print(f"[BROWSER-USE] History has {len(history.history)} entries")
+            # Look for extracted content in action results
+            for entry in reversed(history.history):
+                if hasattr(entry, 'result') and entry.result:
+                    result_str = str(entry.result)
+                    if len(result_str) > 100:  # Meaningful content
+                        final_result = result_str
+                        print(f"[BROWSER-USE] Got result from history entry: {len(result_str)} chars")
+                        break
+
+        # Method 4: Convert entire history to string as fallback
+        if not final_result:
             final_result = str(history)
-        
+            print(f"[BROWSER-USE] Using str(history) as fallback")
+
         print(f"[BROWSER-USE] Task completed. Result length: {len(str(final_result))}")
         
         return {
@@ -858,21 +989,32 @@ async def summarize_node(state: AgentState) -> dict:
             {"id": coordinator_id, "status": "busy", "summary": "Generating answer..."},
         )
     
-    # Extract page content from results
+    # Extract page content from results - pick the BEST (longest) result, not just the first
     page_content = ""
+    best_content_length = 0
+
     for r in results:
         if isinstance(r, dict):
             result = r.get("result", r)
+            candidate = ""
+
             if isinstance(result, dict):
                 if "text" in result:
-                    page_content = result["text"]
-                    break
+                    candidate = result["text"]
                 elif "results" in result:
-                    page_content = str(result["results"])
-                    break
-    
+                    candidate = str(result["results"])
+            elif isinstance(result, str):
+                candidate = result
+
+            # Take the longest content (most likely the extraction result, not switch_tab)
+            if len(candidate) > best_content_length:
+                page_content = candidate
+                best_content_length = len(candidate)
+
     if not page_content:
         page_content = str(results)[:50000]
+
+    print(f"[SUMMARIZE] Best content from {len(results)} results: {best_content_length} chars")
     
     print(f"[SUMMARIZE] Answering after {retry_count} attempts")
     print(f"[SUMMARIZE] Content length: {len(page_content)} chars")
