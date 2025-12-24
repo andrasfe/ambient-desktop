@@ -20,11 +20,13 @@ from .browser import BrowserAgent
 # Falls back to custom BrowserAgent if browser-use is not available
 try:
     from browser_use import Agent as BrowserUseAgent, Browser as BrowserUseBrowser
+    from browser_use.llm.openai.like import ChatOpenAILike as BrowserUseLLM
     BROWSER_USE_AVAILABLE = True
 except ImportError:
     BROWSER_USE_AVAILABLE = False
     BrowserUseAgent = None
     BrowserUseBrowser = None
+    BrowserUseLLM = None
 
 
 class AgentState(TypedDict):
@@ -642,8 +644,13 @@ async def _run_browser_use_task(action: str, params: dict, original_question: st
     
     action_lower = action.lower()
     
-    # Create LLM for browser-use
-    llm = create_llm()
+    # Create LLM for browser-use (using browser-use's own LLM adapter)
+    llm = BrowserUseLLM(
+        model=settings.openrouter_model,
+        base_url=settings.openrouter_base_url,
+        api_key=settings.openrouter_api_key or "lmstudio",  # LMStudio doesn't need a real key
+        temperature=0.7,
+    )
     
     browser = None
     try:
@@ -713,30 +720,52 @@ Important instructions:
         # Run the agent
         history = await agent.run(max_steps=max_steps)
         
-        # Extract result
-        if hasattr(history, 'final_result'):
-            final_result = history.final_result()
-        elif hasattr(history, 'result'):
-            final_result = history.result
-        else:
-            final_result = str(history)
+        # Extract result - ensure it's a clean string
+        final_result = ""
+        try:
+            if hasattr(history, 'final_result'):
+                result = history.final_result()
+                final_result = str(result) if result else ""
+            elif hasattr(history, 'result'):
+                final_result = str(history.result) if history.result else ""
+            else:
+                final_result = str(history)
+        except Exception as e:
+            print(f"[BROWSER-USE] Error extracting result: {e}")
+            final_result = "Error extracting result from browser-use"
         
-        print(f"[BROWSER-USE] Task completed. Result length: {len(str(final_result))}")
+        # Sanitize result - limit size and ensure it's JSON-safe
+        MAX_RESULT_SIZE = 100000  # 100KB limit
+        if len(final_result) > MAX_RESULT_SIZE:
+            final_result = final_result[:MAX_RESULT_SIZE] + "\n\n[Result truncated due to size]"
+        
+        # Remove any problematic characters
+        final_result = final_result.encode('utf-8', errors='replace').decode('utf-8')
+        
+        print(f"[BROWSER-USE] Task completed. Result length: {len(final_result)}")
+        
+        steps_count = 0
+        try:
+            if hasattr(history, 'history'):
+                steps_count = len(history.history)
+        except Exception:
+            pass
         
         return {
             "success": True,
             "text": final_result,
-            "task": task,
-            "steps": len(history.history) if hasattr(history, 'history') else 0,
+            "task": task[:200],  # Limit task size in response
+            "steps": steps_count,
         }
         
     except Exception as e:
-        print(f"[BROWSER-USE] Error: {str(e)}")
+        error_msg = str(e)[:500]  # Limit error message size
+        print(f"[BROWSER-USE] Error: {error_msg}")
         import traceback
         traceback.print_exc()
         return {
             "success": False,
-            "error": str(e),
+            "error": error_msg,
         }
     finally:
         if browser:
