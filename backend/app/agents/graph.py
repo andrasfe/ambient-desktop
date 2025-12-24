@@ -601,10 +601,46 @@ async def browser_node(state: AgentState) -> dict:
             break
     
     try:
+        result = None
+        used_browser_use = False
+        
         if BROWSER_USE_AVAILABLE:
-            # Use browser-use for AI-native automation
-            result = await _run_browser_use_task(action, params, original_question)
-        else:
+            # Try browser-use for AI-native automation
+            try:
+                result = await _run_browser_use_task(action, params, original_question)
+                used_browser_use = True
+                
+                # Check if result is actually useful
+                result_text = result.get("text", "") if result else ""
+                is_empty_result = (
+                    not result_text or
+                    len(result_text) < 100 or
+                    "no patent" in result_text.lower() or
+                    "0 patent" in result_text.lower() or
+                    "not found" in result_text.lower() or
+                    "did not" in result_text.lower() or
+                    "were not" in result_text.lower()
+                )
+                
+                if is_empty_result and result.get("success"):
+                    await ws_manager.broadcast_log(
+                        level="warning",
+                        message="Browser-use returned empty/incomplete results, falling back to legacy agent",
+                        category="browser",
+                    )
+                    print("[BROWSER] Browser-use returned empty results, falling back to legacy agent")
+                    result = None  # Force fallback
+                    
+            except Exception as e:
+                await ws_manager.broadcast_log(
+                    level="warning",
+                    message=f"Browser-use failed: {str(e)[:100]}, falling back to legacy agent",
+                    category="browser",
+                )
+                print(f"[BROWSER] Browser-use failed: {e}, falling back to legacy agent")
+                result = None
+        
+        if result is None:
             # Fallback to custom BrowserAgent
             result = await _run_legacy_browser_task(state, subtask)
         
