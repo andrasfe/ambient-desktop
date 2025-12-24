@@ -20,13 +20,11 @@ from .browser import BrowserAgent
 # Falls back to custom BrowserAgent if browser-use is not available
 try:
     from browser_use import Agent as BrowserUseAgent, Browser as BrowserUseBrowser
-    from browser_use.llm.openai.like import ChatOpenAILike as BrowserUseLLM
     BROWSER_USE_AVAILABLE = True
 except ImportError:
     BROWSER_USE_AVAILABLE = False
     BrowserUseAgent = None
     BrowserUseBrowser = None
-    BrowserUseLLM = None
 
 
 class AgentState(TypedDict):
@@ -602,46 +600,62 @@ async def browser_node(state: AgentState) -> dict:
     
     try:
         result = None
-        used_browser_use = False
         
         if BROWSER_USE_AVAILABLE:
-            # Try browser-use for AI-native automation
-            try:
-                result = await _run_browser_use_task(action, params, original_question)
-                used_browser_use = True
+            # Use browser-use with automatic retry loop on incomplete results
+            max_retries = 3
+            retry_count = 0
+            accumulated_instructions = ""
+            
+            while retry_count <= max_retries:
+                # Build refined question with any accumulated instructions from previous attempts
+                refined_question = original_question
+                if accumulated_instructions:
+                    refined_question = f"{original_question}\n\nADDITIONAL INSTRUCTIONS (based on previous attempt feedback):\n{accumulated_instructions}"
                 
-                # Check if result is actually useful
+                result = await _run_browser_use_task(action, params, refined_question)
                 result_text = result.get("text", "") if result else ""
-                is_empty_result = (
-                    not result_text or
-                    len(result_text) < 100 or
-                    "no patent" in result_text.lower() or
-                    "0 patent" in result_text.lower() or
-                    "not found" in result_text.lower() or
-                    "did not" in result_text.lower() or
-                    "were not" in result_text.lower()
-                )
                 
-                if is_empty_result and result.get("success"):
-                    await ws_manager.broadcast_log(
-                        level="warning",
-                        message="Browser-use returned empty/incomplete results, falling back to legacy agent",
-                        category="browser",
-                    )
-                    print("[BROWSER] Browser-use returned empty results, falling back to legacy agent")
-                    result = None  # Force fallback
+                # Check if result indicates incomplete/failed extraction
+                incomplete_indicators = [
+                    "no patent" in result_text.lower(),
+                    "0 patent" in result_text.lower(),
+                    "not found" in result_text.lower(),
+                    "did not successfully" in result_text.lower(),
+                    "were not properly" in result_text.lower(),
+                    "recommendation" in result_text.lower() and "re-run" in result_text.lower(),
+                ]
+                
+                is_incomplete = any(incomplete_indicators) and len(result_text) < 5000
+                
+                if is_incomplete and result.get("success") and retry_count < max_retries:
+                    retry_count += 1
                     
-            except Exception as e:
-                await ws_manager.broadcast_log(
-                    level="warning",
-                    message=f"Browser-use failed: {str(e)[:100]}, falling back to legacy agent",
-                    category="browser",
-                )
-                print(f"[BROWSER] Browser-use failed: {e}, falling back to legacy agent")
-                result = None
-        
-        if result is None:
-            # Fallback to custom BrowserAgent
+                    # Extract recommendation from the response
+                    recommendation = _extract_recommendation_from_response(result_text)
+                    
+                    if recommendation:
+                        accumulated_instructions = recommendation
+                        await ws_manager.broadcast_log(
+                            level="info",
+                            message=f"[Retry {retry_count}/{max_retries}] Applying browser-use recommendation: {recommendation[:80]}...",
+                            category="browser",
+                        )
+                        print(f"[BROWSER-USE] Retry {retry_count}: {recommendation[:100]}...")
+                    else:
+                        # No clear recommendation, use default aggressive instructions
+                        accumulated_instructions = "Scroll through the ENTIRE page from top to bottom. Click ALL 'Show more', 'Load more', 'Show all' buttons you find. Wait for content to load after each click. Extract ALL items visible on the page."
+                        await ws_manager.broadcast_log(
+                            level="info",
+                            message=f"[Retry {retry_count}/{max_retries}] Retrying with aggressive scroll/expand instructions",
+                            category="browser",
+                        )
+                    continue
+                else:
+                    # Result looks complete or we've exhausted retries
+                    break
+        else:
+            # Fallback to custom BrowserAgent if browser-use not available
             result = await _run_legacy_browser_task(state, subtask)
         
         results = state.get("results", [])
@@ -674,19 +688,62 @@ async def browser_node(state: AgentState) -> dict:
         }
 
 
+def _extract_recommendation_from_response(response_text: str) -> str:
+    """Extract actionable recommendation from browser-use response.
+    
+    Looks for patterns like:
+    - "Recommendation: ..."
+    - "Re-run the extraction with..."
+    - "Try again with..."
+    """
+    import re
+    
+    # Look for explicit recommendations
+    patterns = [
+        r'[Rr]ecommendation[:\s]*(.{50,300}?)(?:\.|$)',
+        r'[Rr]e-?run[^.]*with\s+(.{30,200}?)(?:\.|$)',
+        r'[Tt]ry\s+(?:again\s+)?with\s+(.{30,200}?)(?:\.|$)',
+        r'[Ss]hould\s+(.{30,200}?)(?:\.|$)',
+        r'[Nn]eed\s+to\s+(.{30,200}?)(?:\.|$)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, response_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            recommendation = match.group(1).strip()
+            # Clean up the recommendation
+            recommendation = re.sub(r'\s+', ' ', recommendation)
+            if len(recommendation) > 20:
+                return recommendation
+    
+    # If no explicit recommendation, look for action verbs
+    action_patterns = [
+        r'(scroll\s+(?:fully|through|down)[^.]{10,100})',
+        r'(click\s+(?:all|every)[^.]{10,100})',
+        r'(load\s+more[^.]{10,100})',
+        r'(expand\s+(?:all|every)[^.]{10,100})',
+    ]
+    
+    recommendations = []
+    for pattern in action_patterns:
+        match = re.search(pattern, response_text, re.IGNORECASE)
+        if match:
+            recommendations.append(match.group(1).strip())
+    
+    if recommendations:
+        return " AND ".join(recommendations[:3])
+    
+    return ""
+
+
 async def _run_browser_use_task(action: str, params: dict, original_question: str) -> dict:
     """Run a task using browser-use library."""
     import asyncio
     
     action_lower = action.lower()
     
-    # Create LLM for browser-use (using browser-use's own LLM adapter)
-    llm = BrowserUseLLM(
-        model=settings.openrouter_model,
-        base_url=settings.openrouter_base_url,
-        api_key=settings.openrouter_api_key or "lmstudio",  # LMStudio doesn't need a real key
-        temperature=0.7,
-    )
+    # Create LLM for browser-use
+    llm = create_llm()
     
     browser = None
     try:
@@ -756,52 +813,30 @@ Important instructions:
         # Run the agent
         history = await agent.run(max_steps=max_steps)
         
-        # Extract result - ensure it's a clean string
-        final_result = ""
-        try:
-            if hasattr(history, 'final_result'):
-                result = history.final_result()
-                final_result = str(result) if result else ""
-            elif hasattr(history, 'result'):
-                final_result = str(history.result) if history.result else ""
-            else:
-                final_result = str(history)
-        except Exception as e:
-            print(f"[BROWSER-USE] Error extracting result: {e}")
-            final_result = "Error extracting result from browser-use"
+        # Extract result
+        if hasattr(history, 'final_result'):
+            final_result = history.final_result()
+        elif hasattr(history, 'result'):
+            final_result = history.result
+        else:
+            final_result = str(history)
         
-        # Sanitize result - limit size and ensure it's JSON-safe
-        MAX_RESULT_SIZE = 100000  # 100KB limit
-        if len(final_result) > MAX_RESULT_SIZE:
-            final_result = final_result[:MAX_RESULT_SIZE] + "\n\n[Result truncated due to size]"
-        
-        # Remove any problematic characters
-        final_result = final_result.encode('utf-8', errors='replace').decode('utf-8')
-        
-        print(f"[BROWSER-USE] Task completed. Result length: {len(final_result)}")
-        
-        steps_count = 0
-        try:
-            if hasattr(history, 'history'):
-                steps_count = len(history.history)
-        except Exception:
-            pass
+        print(f"[BROWSER-USE] Task completed. Result length: {len(str(final_result))}")
         
         return {
             "success": True,
             "text": final_result,
-            "task": task[:200],  # Limit task size in response
-            "steps": steps_count,
+            "task": task,
+            "steps": len(history.history) if hasattr(history, 'history') else 0,
         }
         
     except Exception as e:
-        error_msg = str(e)[:500]  # Limit error message size
-        print(f"[BROWSER-USE] Error: {error_msg}")
+        print(f"[BROWSER-USE] Error: {str(e)}")
         import traceback
         traceback.print_exc()
         return {
             "success": False,
-            "error": error_msg,
+            "error": str(e),
         }
     finally:
         if browser:
