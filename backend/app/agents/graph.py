@@ -86,16 +86,23 @@ def create_browser_use_llm():
     
     # Check if using local LLM (Ollama/LMStudio)
     if settings.is_local_llm:
-        # LMStudio uses OpenAI-compatible API, so we can use Ollama client with custom host
-        # Extract host from base URL (e.g., "http://localhost:1234/v1" -> "http://localhost:1234")
-        base_url = settings.openrouter_base_url
-        if base_url and base_url.endswith("/v1"):
-            base_url = base_url[:-3]  # Remove /v1 suffix
+        # Check if it's specifically Ollama (port 11434) vs LMStudio (port 1234)
+        base_url = settings.openrouter_base_url or ""
         
-        return BrowserUseChatOllama(
-            model=settings.openrouter_model,
-            host=base_url,
-        )
+        if ":11434" in base_url:
+            # Pure Ollama - use Ollama client
+            host = base_url.replace("/v1", "").rstrip("/")
+            return BrowserUseChatOllama(
+                model=settings.openrouter_model,
+                host=host,
+            )
+        else:
+            # LMStudio or other OpenAI-compatible local LLM
+            return BrowserUseChatOpenAI(
+                model=settings.openrouter_model,
+                api_key=settings.openrouter_api_key or "lmstudio",
+                base_url=base_url if base_url.endswith("/v1") else f"{base_url}/v1",
+            )
     
     # Cloud API (OpenRouter) - use browser-use's ChatOpenAI with custom base_url
     return BrowserUseChatOpenAI(
@@ -635,17 +642,18 @@ async def browser_node(state: AgentState) -> dict:
             if accumulated_instructions:
                 refined_question = f"{original_question}\n\nADDITIONAL INSTRUCTIONS (based on previous attempt feedback):\n{accumulated_instructions}"
             
-            result = await _run_browser_use_task(action, params, refined_question)
-            result_text = result.get("text", "") if result else ""
+            result = await _run_browser_use_task(action or "extract", params or {}, refined_question)
+            result_text = (result.get("text") or "") if result else ""
+            result_text_lower = result_text.lower() if result_text else ""
             
             # Check if result indicates incomplete/failed extraction
             incomplete_indicators = [
-                "no patent" in result_text.lower(),
-                "0 patent" in result_text.lower(),
-                "not found" in result_text.lower(),
-                "did not successfully" in result_text.lower(),
-                "were not properly" in result_text.lower(),
-                "recommendation" in result_text.lower() and "re-run" in result_text.lower(),
+                "no patent" in result_text_lower,
+                "0 patent" in result_text_lower,
+                "not found" in result_text_lower,
+                "did not successfully" in result_text_lower,
+                "were not properly" in result_text_lower,
+                "recommendation" in result_text_lower and "re-run" in result_text_lower,
             ]
             
             is_incomplete = any(incomplete_indicators) and len(result_text) < 5000
@@ -759,7 +767,7 @@ async def _run_browser_use_task(action: str, params: dict, original_question: st
     """Run a task using browser-use library."""
     import asyncio
     
-    action_lower = action.lower()
+    action_lower = (action or "extract").lower()
     
     # Create LLM for browser-use (uses browser-use's own LLM classes)
     llm = create_browser_use_llm()
