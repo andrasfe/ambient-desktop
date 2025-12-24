@@ -15,9 +15,7 @@ from ..services.websocket import ws_manager, EventType
 
 # Browser-use for AI-native browser automation
 from browser_use import Agent as BrowserUseAgent, Browser as BrowserUseBrowser
-# Browser-use has its own LLM wrappers that are required for its Agent
 from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
-from browser_use.llm.ollama.chat import ChatOllama as BrowserUseChatOllama
 
 
 class AgentState(TypedDict):
@@ -57,9 +55,9 @@ class AgentState(TypedDict):
 
 
 def create_llm():
-    """Create the LLM instance for LangGraph coordinator (uses langchain ChatOpenAI)."""
+    """Create the LLM instance (OpenRouter, Ollama, or any OpenAI-compatible API)."""
     
-    # Check if using local LLM (Ollama/LMStudio)
+    # Check if using local LLM (Ollama)
     if settings.is_local_llm:
         return ChatOpenAI(
             model=settings.openrouter_model,
@@ -84,35 +82,15 @@ def create_llm():
 def create_browser_use_llm():
     """Create the LLM instance for browser-use Agent (uses browser-use's own LLM classes)."""
     
-    # Check if using local LLM (Ollama/LMStudio)
-    if settings.is_local_llm:
-        # Check if it's specifically Ollama (port 11434) vs LMStudio (port 1234)
-        base_url = settings.openrouter_base_url or ""
-        
-        if ":11434" in base_url:
-            # Pure Ollama - use Ollama client
-            host = base_url.replace("/v1", "").rstrip("/")
-            return BrowserUseChatOllama(
-                model=settings.openrouter_model,
-                host=host,
-            )
-        else:
-            # LMStudio or other OpenAI-compatible local LLM
-            return BrowserUseChatOpenAI(
-                model=settings.openrouter_model,
-                api_key=settings.openrouter_api_key or "lmstudio",
-                base_url=base_url if base_url.endswith("/v1") else f"{base_url}/v1",
-            )
-    
-    # Cloud API (OpenRouter) - use browser-use's ChatOpenAI with custom base_url
+    # Use browser-use's ChatOpenAI for all cases (cloud and local OpenAI-compatible)
     return BrowserUseChatOpenAI(
         model=settings.openrouter_model,
-        api_key=settings.openrouter_api_key,
+        api_key=settings.openrouter_api_key or "local",
         base_url=settings.openrouter_base_url,
         default_headers={
             "HTTP-Referer": "https://ambient-desktop.local",
             "X-Title": "Ambient Desktop Agent",
-        },
+        } if not settings.is_local_llm else None,
     )
 
 
@@ -314,18 +292,14 @@ async def coordinator_node(state: AgentState) -> dict:
                 
                 current_url = await browser.get_current_page_url()
                 current_title = await browser.get_current_page_title()
-                tabs = await browser.get_tabs()
                 
                 await browser.stop()
                 
                 if current_url:
-                    tabs_info = "\n".join([f"  - Tab {i}: {t.get('title', 'untitled')} ({t.get('url', '')})" for i, t in enumerate(tabs or [])])
                     browser_context = f"""
 CURRENT BROWSER STATE:
 - Active tab: {current_title or 'unknown'}
 - Active URL: {current_url or 'unknown'}
-- All open tabs:
-{tabs_info}
 
 IMPORTANT: Check if the content user wants is ALREADY visible on the active tab.
 If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab" first.
@@ -630,60 +604,8 @@ async def browser_node(state: AgentState) -> dict:
             break
     
     try:
-        # Use browser-use with automatic retry loop on incomplete results
-        max_retries = 3
-        retry_count = 0
-        accumulated_instructions = ""
-        result = None
-        
-        while retry_count <= max_retries:
-            # Build refined question with any accumulated instructions from previous attempts
-            refined_question = original_question
-            if accumulated_instructions:
-                refined_question = f"{original_question}\n\nADDITIONAL INSTRUCTIONS (based on previous attempt feedback):\n{accumulated_instructions}"
-            
-            result = await _run_browser_use_task(action or "extract", params or {}, refined_question)
-            result_text = (result.get("text") or "") if result else ""
-            result_text_lower = result_text.lower() if result_text else ""
-            
-            # Check if result indicates incomplete/failed extraction
-            incomplete_indicators = [
-                "no patent" in result_text_lower,
-                "0 patent" in result_text_lower,
-                "not found" in result_text_lower,
-                "did not successfully" in result_text_lower,
-                "were not properly" in result_text_lower,
-                "recommendation" in result_text_lower and "re-run" in result_text_lower,
-            ]
-            
-            is_incomplete = any(incomplete_indicators) and len(result_text) < 5000
-            
-            if is_incomplete and result.get("success") and retry_count < max_retries:
-                retry_count += 1
-                
-                # Extract recommendation from the response
-                recommendation = _extract_recommendation_from_response(result_text)
-                
-                if recommendation:
-                    accumulated_instructions = recommendation
-                    await ws_manager.broadcast_log(
-                        level="info",
-                        message=f"[Retry {retry_count}/{max_retries}] Applying browser-use recommendation: {recommendation[:80]}...",
-                        category="browser",
-                    )
-                    print(f"[BROWSER-USE] Retry {retry_count}: {recommendation[:100]}...")
-                else:
-                    # No clear recommendation, use default aggressive instructions
-                    accumulated_instructions = "Scroll through the ENTIRE page from top to bottom. Click ALL 'Show more', 'Load more', 'Show all' buttons you find. Wait for content to load after each click. Extract ALL items visible on the page."
-                    await ws_manager.broadcast_log(
-                        level="info",
-                        message=f"[Retry {retry_count}/{max_retries}] Retrying with aggressive scroll/expand instructions",
-                        category="browser",
-                    )
-                continue
-            else:
-                # Result looks complete or we've exhausted retries
-                break
+        # Use browser-use for AI-native automation
+        result = await _run_browser_use_task(action or "extract", params or {}, original_question)
         
         results = state.get("results", [])
         results.append({"subtask": subtask, "result": result})
@@ -713,54 +635,6 @@ async def browser_node(state: AgentState) -> dict:
             "next_action": "summarize",
             "messages": [AIMessage(content=f"Browser error: {str(e)}")],
         }
-
-
-def _extract_recommendation_from_response(response_text: str) -> str:
-    """Extract actionable recommendation from browser-use response.
-    
-    Looks for patterns like:
-    - "Recommendation: ..."
-    - "Re-run the extraction with..."
-    - "Try again with..."
-    """
-    import re
-    
-    # Look for explicit recommendations
-    patterns = [
-        r'[Rr]ecommendation[:\s]*(.{50,300}?)(?:\.|$)',
-        r'[Rr]e-?run[^.]*with\s+(.{30,200}?)(?:\.|$)',
-        r'[Tt]ry\s+(?:again\s+)?with\s+(.{30,200}?)(?:\.|$)',
-        r'[Ss]hould\s+(.{30,200}?)(?:\.|$)',
-        r'[Nn]eed\s+to\s+(.{30,200}?)(?:\.|$)',
-    ]
-    
-    for pattern in patterns:
-        match = re.search(pattern, response_text, re.IGNORECASE | re.DOTALL)
-        if match:
-            recommendation = match.group(1).strip()
-            # Clean up the recommendation
-            recommendation = re.sub(r'\s+', ' ', recommendation)
-            if len(recommendation) > 20:
-                return recommendation
-    
-    # If no explicit recommendation, look for action verbs
-    action_patterns = [
-        r'(scroll\s+(?:fully|through|down)[^.]{10,100})',
-        r'(click\s+(?:all|every)[^.]{10,100})',
-        r'(load\s+more[^.]{10,100})',
-        r'(expand\s+(?:all|every)[^.]{10,100})',
-    ]
-    
-    recommendations = []
-    for pattern in action_patterns:
-        match = re.search(pattern, response_text, re.IGNORECASE)
-        if match:
-            recommendations.append(match.group(1).strip())
-    
-    if recommendations:
-        return " AND ".join(recommendations[:3])
-    
-    return ""
 
 
 async def _run_browser_use_task(action: str, params: dict, original_question: str) -> dict:
