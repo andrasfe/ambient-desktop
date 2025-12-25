@@ -749,9 +749,13 @@ async def _run_browser_use_task(action: str, params: dict, original_question: st
         # Disable DOM highlighting to reduce interference
         if settings.browser_cdp_url:
             # Connect to existing Chrome via CDP
+            # CRITICAL: Use headless=False and no_viewport=True to prevent browser-use
+            # from sending CDP Emulation.setDeviceMetricsOverride commands that would
+            # affect ALL Chrome tabs (including the frontend UI at localhost:3000)
             browser = BrowserUseBrowser(
                 cdp_url=settings.browser_cdp_url,
-                headless=settings.browser_headless,
+                headless=False,  # Must be False for CDP connection to allow no_viewport=True
+                no_viewport=True,  # Prevents viewport manipulation that breaks other tabs
                 highlight_elements=False,
                 dom_highlight_elements=False,
             )
