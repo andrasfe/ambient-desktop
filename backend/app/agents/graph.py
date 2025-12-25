@@ -642,98 +642,6 @@ async def browser_node(state: AgentState) -> dict:
         }
 
 
-async def _fast_linkedin_patents_extraction(browser) -> dict | None:
-    """Fast path for extracting patents from LinkedIn patents page using direct DOM scraping."""
-    try:
-        # Get current page URL to check if we're on a LinkedIn patents page
-        await browser.start()
-        current_url = await browser.get_current_page_url()
-
-        if not current_url or "/details/patents" not in current_url:
-            return None  # Not on patents page, use normal extraction
-
-        print("[BROWSER-USE] Fast path: LinkedIn patents page detected, using direct DOM extraction")
-
-        # Get the browser context to run JavaScript
-        context = await browser.get_current_context()
-        page = context.pages[0] if context.pages else None
-
-        if not page:
-            return None
-
-        # First scroll the entire page to load all patents
-        await page.evaluate("""
-            async () => {
-                let lastHeight = 0;
-                for (let i = 0; i < 20; i++) {
-                    window.scrollTo(0, document.body.scrollHeight);
-                    await new Promise(r => setTimeout(r, 500));
-                    if (document.body.scrollHeight === lastHeight) break;
-                    lastHeight = document.body.scrollHeight;
-                }
-                window.scrollTo(0, 0);
-            }
-        """)
-
-        # Wait for content to settle
-        import asyncio
-        await asyncio.sleep(2)
-
-        # Extract patents using a robust JavaScript DOM scraper
-        patents_data = await page.evaluate("""
-            () => {
-                const patents = [];
-                // Find all patent entries - they're usually in li elements or divs with patent info
-                const entries = document.querySelectorAll('li[class*="list"], div[class*="pvs-list__paged-list-wrapper"] li');
-
-                for (const entry of entries) {
-                    const text = entry.innerText || '';
-                    // Skip if doesn't look like a patent entry
-                    if (!text.includes('Patent') && !text.includes('US ') && !text.includes('Issued') && !text.includes('Filed')) {
-                        continue;
-                    }
-
-                    // Extract patent info
-                    const lines = text.split('\\n').map(l => l.trim()).filter(l => l);
-                    if (lines.length >= 2) {
-                        const title = lines[0];
-                        const numberAndDate = lines.slice(1).join(' ');
-
-                        // Try to extract patent number
-                        const numberMatch = numberAndDate.match(/(US \\d[\\d,\\s\\/]+[A-Z0-9]*|\\d{10,})/i);
-                        const dateMatch = numberAndDate.match(/(Issued|Filed)[^\\d]*(\\w+ \\d+, \\d{4})/i);
-
-                        patents.push({
-                            title: title,
-                            number: numberMatch ? numberMatch[0].trim() : null,
-                            date_info: dateMatch ? `${dateMatch[1]} ${dateMatch[2]}` : null,
-                            raw: lines.slice(0, 3).join(' | ')
-                        });
-                    }
-                }
-
-                return patents;
-            }
-        """)
-
-        if patents_data and len(patents_data) > 0:
-            print(f"[BROWSER-USE] Fast extraction got {len(patents_data)} patents")
-            import json
-            return {
-                "success": True,
-                "text": json.dumps(patents_data, indent=2),
-                "task": "Direct DOM extraction of LinkedIn patents",
-                "steps": 1,
-                "count": len(patents_data),
-            }
-
-        return None  # Fallback to normal extraction if this didn't work
-
-    except Exception as e:
-        print(f"[BROWSER-USE] Fast extraction failed: {e}")
-        return None  # Fallback to normal extraction
-
-
 async def _run_browser_use_task(action: str, params: dict, original_question: str) -> dict:
     """Run a task using browser-use library."""
     import asyncio
@@ -765,13 +673,6 @@ async def _run_browser_use_task(action: str, params: dict, original_question: st
                 highlight_elements=False,
                 dom_highlight_elements=False,
             )
-
-        # Check for fast extraction paths (LinkedIn patents, etc.)
-        question_lower = original_question.lower()
-        if "patent" in question_lower and ("extract" in action_lower or "get_text" in action_lower):
-            fast_result = await _fast_linkedin_patents_extraction(browser)
-            if fast_result:
-                return fast_result
 
         # Construct the task based on action type
         if "extract" in action_lower or "get_text" in action_lower or "scrape" in action_lower:
@@ -822,6 +723,7 @@ Important instructions:
             llm=llm,
             browser=browser,
             max_actions_per_step=5,
+            llm_timeout=180,  # 3 minutes - OpenRouter via cloud can be slow
         )
         
         # Run the agent
