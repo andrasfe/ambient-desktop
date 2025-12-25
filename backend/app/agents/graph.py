@@ -20,14 +20,17 @@ from browser_use.llm.openai.chat import ChatOpenAI as BrowserUseChatOpenAI
 
 class AgentState(TypedDict):
     """State passed between nodes in the graph."""
-    
+
     # Conversation messages
     messages: Annotated[list[BaseMessage], operator.add]
-    
+
     # Current task information
     task_id: Optional[str]
     task_type: Optional[str]  # "browser", "file", "mcp"
     task_payload: Optional[dict]
+
+    # Cancellation support - asyncio.Event passed from orchestrator
+    cancel_event: Optional[Any]
     
     # Execution tracking
     subtasks: list[dict]
@@ -186,10 +189,15 @@ async def coordinator_node(state: AgentState) -> dict:
         {
             "id": coordinator_id,
             "type": "coordinator",
-            "name": f"coordinator-{coordinator_id[:8]}",
+            "name": "Coordinator",
             "status": "busy",
             "summary": "Analyzing request...",
         },
+    )
+    await ws_manager.broadcast_log(
+        level="info",
+        message="Coordinator started - analyzing your request",
+        category="coordinator",
     )
     
     try:
@@ -460,7 +468,24 @@ If yes, just "extract" with empty params {{}}. If on wrong tab, use "switch_tab"
                     "summary": f"Delegating {len(subtasks)} task(s)" if subtasks else "Response ready",
                 },
             )
-            
+
+            # Log the plan for user visibility
+            if subtasks:
+                task_summary = ", ".join([s.get("action", "unknown") for s in subtasks[:3]])
+                if len(subtasks) > 3:
+                    task_summary += f"... (+{len(subtasks) - 3} more)"
+                await ws_manager.broadcast_log(
+                    level="info",
+                    message=f"Created plan with {len(subtasks)} task(s): {task_summary}",
+                    category="coordinator",
+                )
+            else:
+                await ws_manager.broadcast_log(
+                    level="info",
+                    message="No browser tasks needed - responding directly",
+                    category="coordinator",
+                )
+
             # Determine next action
             if subtasks:
                 next_action = subtasks[0].get("agent", "end")
@@ -608,21 +633,70 @@ async def browser_node(state: AgentState) -> dict:
             original_question = msg.content
             break
     
+    # Get cancel_event from state for graceful cancellation
+    cancel_event = state.get("cancel_event")
+
     try:
         # Use browser-use for AI-native automation
-        result = await _run_browser_use_task(action or "extract", params or {}, original_question)
-        
+        await ws_manager.broadcast_log(
+            level="info",
+            message=f"Starting browser task: {action} (subtask {index + 1}/{len(subtasks)})",
+            category="browser",
+        )
+
+        result = await _run_browser_use_task(action or "extract", params or {}, original_question, cancel_event)
+
         results = state.get("results", [])
         results.append({"subtask": subtask, "result": result})
-        
-        # Determine next step
+
+        # Check if browser-use failed or indicates it cannot complete the task
+        is_failure = False
+        failure_reason = ""
+
+        if not result.get("success", True):
+            is_failure = True
+            failure_reason = result.get("error", "Unknown error")
+        elif result.get("text"):
+            text_lower = str(result.get("text", "")).lower()
+            failure_phrases = [
+                "cannot complete", "unable to", "i cannot", "i can't",
+                "not possible", "failed to", "error occurred", "no data found",
+                "page not found", "access denied", "cannot access"
+            ]
+            for phrase in failure_phrases:
+                if phrase in text_lower:
+                    is_failure = True
+                    failure_reason = f"Browser agent indicated: {phrase}"
+                    break
+
+        # If failed, skip remaining subtasks and go straight to summarize
+        if is_failure:
+            await ws_manager.broadcast_log(
+                level="warn",
+                message=f"Browser task failed: {failure_reason}. Skipping remaining subtasks.",
+                category="browser",
+            )
+            return {
+                "results": results,
+                "current_subtask_index": len(subtasks),  # Skip to end
+                "next_action": "summarize",
+                "messages": [AIMessage(content=f"Browser task failed: {failure_reason}")],
+            }
+
+        # Success - log and determine next step
+        await ws_manager.broadcast_log(
+            level="info",
+            message=f"Browser task completed successfully (subtask {index + 1}/{len(subtasks)})",
+            category="browser",
+        )
+
         next_index = index + 1
         if next_index < len(subtasks):
             next_subtask = subtasks[next_index]
             next_action = next_subtask.get("agent", "coordinator")
         else:
             next_action = "summarize"
-        
+
         return {
             "results": results,
             "current_subtask_index": next_index,
@@ -642,11 +716,18 @@ async def browser_node(state: AgentState) -> dict:
         }
 
 
-async def _run_browser_use_task(action: str, params: dict, original_question: str) -> dict:
+async def _run_browser_use_task(action: str, params: dict, original_question: str, cancel_event=None) -> dict:
     """Run a task using browser-use library."""
     import asyncio
 
     action_lower = (action or "extract").lower()
+
+    # Create should_stop callback for graceful cancellation
+    async def should_stop_callback():
+        if cancel_event and cancel_event.is_set():
+            print("[BROWSER-USE] Cancellation requested, stopping agent...")
+            return True
+        return False
 
     # Create LLM for browser-use (uses browser-use's own LLM classes)
     llm = create_browser_use_llm()
@@ -716,7 +797,37 @@ Important instructions:
             category="browser",
         )
         print(f"[BROWSER-USE] Starting task: {task[:100]}...")
-        
+
+        # Create visible browser agent in UI
+        browser_agent_id = str(uuid7())
+        await ws_manager.broadcast(
+            EventType.AGENT_CREATED,
+            {
+                "id": browser_agent_id,
+                "type": "browser",
+                "name": "Browser Agent",
+                "status": "busy",
+                "summary": f"Running: {task[:60]}...",
+            },
+        )
+
+        # Callback to update UI on each step
+        async def on_step_callback(browser_state, agent_output, step_num):
+            progress = min(step_num / max_steps, 0.99)  # Cap at 99% until done
+            summary = f"Step {step_num}/{max_steps}"
+            if agent_output and hasattr(agent_output, 'current_state'):
+                if hasattr(agent_output.current_state, 'next_goal'):
+                    summary = f"Step {step_num}: {str(agent_output.current_state.next_goal)[:50]}"
+            await ws_manager.broadcast(
+                EventType.AGENT_UPDATE,
+                {
+                    "id": browser_agent_id,
+                    "status": "busy",
+                    "summary": summary,
+                    "progress": progress,
+                },
+            )
+
         # Create and run browser-use agent
         agent = BrowserUseAgent(
             task=task,
@@ -724,8 +835,10 @@ Important instructions:
             browser=browser,
             max_actions_per_step=5,
             llm_timeout=180,  # 3 minutes - OpenRouter via cloud can be slow
+            register_new_step_callback=on_step_callback,
+            register_should_stop_callback=should_stop_callback,
         )
-        
+
         # Run the agent
         history = await agent.run(max_steps=max_steps)
 
@@ -760,18 +873,41 @@ Important instructions:
             print(f"[BROWSER-USE] Using str(history) as fallback")
 
         print(f"[BROWSER-USE] Task completed. Result length: {len(str(final_result))}")
-        
+
+        # Update browser agent as completed
+        steps_count = len(history.history) if hasattr(history, 'history') else 0
+        await ws_manager.broadcast(
+            EventType.AGENT_UPDATE,
+            {
+                "id": browser_agent_id,
+                "status": "stopped",
+                "summary": f"Completed in {steps_count} steps",
+            },
+        )
+        await ws_manager.broadcast(EventType.AGENT_REMOVED, {"id": browser_agent_id})
+
         return {
             "success": True,
             "text": final_result,
             "task": task,
-            "steps": len(history.history) if hasattr(history, 'history') else 0,
+            "steps": steps_count,
         }
-        
+
     except Exception as e:
         print(f"[BROWSER-USE] Error: {str(e)}")
         import traceback
         traceback.print_exc()
+
+        # Update browser agent as error (if it was created)
+        try:
+            await ws_manager.broadcast(
+                EventType.AGENT_UPDATE,
+                {"id": browser_agent_id, "status": "error", "summary": str(e)[:100]},
+            )
+            await ws_manager.broadcast(EventType.AGENT_REMOVED, {"id": browser_agent_id})
+        except NameError:
+            pass  # browser_agent_id wasn't created yet
+
         return {
             "success": False,
             "error": str(e),
@@ -866,19 +1002,25 @@ async def file_node(state: AgentState) -> dict:
 async def summarize_node(state: AgentState) -> dict:
     """Summarize the results and answer the user's original question."""
     llm = create_llm()
-    
+
     results = state.get("results", [])
     error = state.get("error")
     coordinator_id = state.get("coordinator_id")
     retry_count = state.get("retry_count", 0)
-    
+
+    await ws_manager.broadcast_log(
+        level="info",
+        message=f"Summarizing results ({len(results)} result(s) collected)",
+        category="coordinator",
+    )
+
     # Get the user's original question from the conversation
     original_question = ""
     for msg in state.get("messages", []):
         if isinstance(msg, HumanMessage):
             original_question = msg.content
             break
-    
+
     if not results and not error:
         if coordinator_id:
             await ws_manager.broadcast(
@@ -1122,6 +1264,7 @@ class AgentOrchestrator:
             "task_id": None,
             "task_type": None,
             "task_payload": None,
+            "cancel_event": cancel_event,  # Pass cancel event to nodes
             "subtasks": [],
             "current_subtask_index": 0,
             "results": [],

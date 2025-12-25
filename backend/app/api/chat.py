@@ -117,7 +117,7 @@ async def process_and_respond(
             return
         
         print(f"[CHAT-WS] Response preview: {full_response[:200]}...")
-        if full_response and not full_response.startswith("{"):
+        if full_response:
             try:
                 await ws_manager.send_event(
                     client_id,
